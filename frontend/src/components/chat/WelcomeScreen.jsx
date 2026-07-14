@@ -14,7 +14,7 @@ function WelcomeScreen({ onPickTopic }) {
     <div className="flex flex-col items-center justify-center min-h-[60vh] text-center">
       <div className="w-16 h-16 rounded-full overflow-hidden mb-4 shadow-lg">
         <img
-          src="./src/assets/logo-icon.png"
+          src="/logo.png"
           alt="Along"
           className="w-full h-full object-cover"
           onError={(e) => { e.target.style.display = 'none' }}
