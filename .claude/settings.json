@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go version *)",
+      "Bash(go build *)",
+      "Bash(go vet *)",
+      "Read(//tmp/**)",
+      "Bash(rm /tmp/along-test.exe)",
+      "Bash(go fmt *)",
+      "Bash(rm /tmp/along-final.exe)"
+    ]
+  }
+}

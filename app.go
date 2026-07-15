@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"ai-companion/internal/ai"
 	"ai-companion/internal/agents"
+	"ai-companion/internal/ai"
 	"ai-companion/internal/automation"
 	"ai-companion/internal/core"
 	"ai-companion/internal/db"
@@ -26,81 +26,127 @@ import (
 
 // App 应用主结构
 type App struct {
-	ctx             context.Context
-	db              *sql.DB
-	aiClient        *ai.Client
-	companionCore   *core.CompanionCore
-	settings        *services.SettingsService
-	memory          *services.MemoryService
-	conversation    *services.ConversationService
-	plan            *services.PlanService
+	ctx              context.Context
+	db               *sql.DB
+	aiClient         *ai.Client
+	companionCore    *core.CompanionCore
+	settings         *services.SettingsService
+	memory           *services.MemoryService
+	conversation     *services.ConversationService
+	plan             *services.PlanService
 	automationEngine *automation.Engine
-	dataDir         string
-	shutdownOnce    sync.Once
-	isShuttingDown  bool
-	mu              sync.Mutex
+	dataDir          string
+	shutdownOnce     sync.Once
+	isShuttingDown   bool
+	mu               sync.Mutex
 }
 
 // NewApp 创建新应用实例
-func NewApp() *App {
-	return &App{}
+func NewApp() (*App, error) {
+	app := &App{}
+
+	// 初始化数据目录
+	fmt.Println("正在初始化数据目录...")
+	appDataDir, err := app.getDataDir()
+	if err != nil {
+		return nil, fmt.Errorf("无法获取数据目录: %w", err)
+	}
+	app.dataDir = appDataDir
+	fmt.Println("数据目录:", app.dataDir)
+
+	// 创建必要的子目录
+	app.ensureDirectories()
+
+	// 初始化数据库
+	fmt.Println("正在初始化数据库...")
+	database, err := db.InitDB(filepath.Join(app.dataDir, "companion.db"))
+	if err != nil {
+		return nil, fmt.Errorf("数据库初始化失败: %w", err)
+	}
+	app.db = database
+	fmt.Println("数据库连接成功")
+
+	// 初始化服务
+	fmt.Println("正在初始化服务...")
+	app.settings = services.NewSettingsService(app.db)
+	if app.settings == nil {
+		return nil, fmt.Errorf("设置服务创建失败")
+	}
+	app.memory = services.NewMemoryService(app.db)
+	app.conversation = services.NewConversationService(app.db)
+	app.conversation.SetConversationsDir(filepath.Join(app.dataDir, "conversations"))
+	app.plan = services.NewPlanService(app.db)
+	fmt.Println("服务初始化成功")
+
+	// 初始化默认设置
+	fmt.Println("正在初始化默认设置...")
+	if err := app.settings.InitDefaults(); err != nil {
+		return nil, fmt.Errorf("初始化默认设置失败: %w", err)
+	}
+	fmt.Println("默认设置初始化完成")
+
+	// 初始化系统任务模板（不依赖自动化引擎，确保模板一定存在）
+	fmt.Println("正在初始化任务模板...")
+	app.initTaskTemplates()
+	fmt.Println("任务模板初始化完成")
+
+	// 初始化 AI 客户端（支持多 provider）
+	fmt.Println("正在初始化 AI 客户端...")
+	app.initAIClient()
+	fmt.Println("AI 客户端初始化完成")
+
+	fmt.Println("Along 核心初始化完成")
+	return app, nil
 }
 
 // startup 应用启动时调用
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
-	// 初始化数据目录
-	appDataDir, err := a.getDataDir()
-	if err != nil {
-		fmt.Println("无法获取数据目录:", err)
-		return
-	}
-	a.dataDir = appDataDir
-
-	// 创建必要的子目录
-	a.ensureDirectories()
-
-	// 初始化数据库
-	database, err := db.InitDB(filepath.Join(a.dataDir, "companion.db"))
-	if err != nil {
-		fmt.Println("数据库初始化失败:", err)
-		return
-	}
-	a.db = database
-
-	// 初始化服务
-	a.settings = services.NewSettingsService(a.db)
-	a.memory = services.NewMemoryService(a.db)
-	a.conversation = services.NewConversationService(a.db)
-	a.conversation.SetConversationsDir(filepath.Join(a.dataDir, "conversations"))
-	a.plan = services.NewPlanService(a.db)
-
-	// 初始化 AI 客户端（支持多 provider）
-	a.initAIClient()
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("应用启动时发生 panic: %v\n", r)
+		}
+	}()
 
 	// 初始化 Companion Core
-	a.companionCore = core.NewCompanionCore(a.aiClient, a.memory, a.conversation, a.plan)
+	if a.aiClient != nil && a.memory != nil && a.conversation != nil && a.plan != nil {
+		a.companionCore = core.NewCompanionCore(a.aiClient, a.memory, a.conversation, a.plan)
 
-	// 设置文件生成 Agent 的输出目录
-	if fileAgent := a.companionCore.GetFileGenerationAgent(); fileAgent != nil {
-		fileAgent.SetOutputDir(filepath.Join(a.dataDir, "research_docs"))
+		// 设置文件生成 Agent 的输出目录
+		if fileAgent := a.companionCore.GetFileGenerationAgent(); fileAgent != nil {
+			fileAgent.SetOutputDir(filepath.Join(a.dataDir, "research_docs"))
+		}
 	}
 
 	// 初始化自动化引擎
-	a.automationEngine = automation.NewEngine(a.db, a.companionCore.GetAgentManager(), a.dataDir)
-	if err := a.automationEngine.Start(); err != nil {
-		fmt.Println("自动化引擎启动失败:", err)
+	if a.db != nil && a.companionCore != nil {
+		a.automationEngine = automation.NewEngine(a.db, a.companionCore.GetAgentManager(), a.dataDir)
+		if err := a.automationEngine.Start(); err != nil {
+			fmt.Println("自动化引擎启动失败:", err)
+		}
+
+		// 设置自动化服务到 companionCore（用于斜杠命令调用）
+		a.companionCore.SetAutomationService(a.automationEngine.GetService())
+		a.companionCore.SetTaskExecutor(a.automationEngine)
+
+		// 初始化默认的AI前沿知识调研任务
+		a.initDefaultResearchTask()
 	}
+
+	// 注册设置变更钩子
+	a.setupSettingHooks()
 
 	// 同步开机启动设置（仅 Windows）
 	a.syncAutoStart()
 
 	// 启动系统托盘（如果启用）
 	trayEnabled := true
-	trayVal, _ := a.settings.Get("system_tray_enabled")
-	if trayVal == "false" || trayVal == "0" {
-		trayEnabled = false
+	if a.settings != nil {
+		trayVal, _ := a.settings.Get("system_tray_enabled")
+		if trayVal == "false" || trayVal == "0" {
+			trayEnabled = false
+		}
 	}
 	if trayEnabled {
 		StartTray(a)
@@ -112,7 +158,7 @@ func (a *App) startup(ctx context.Context) {
 		}()
 	}
 
-	fmt.Println("AI Companion 已启动")
+	fmt.Println("Along 已启动")
 }
 
 // initAIClient 初始化 AI 客户端
@@ -184,7 +230,7 @@ func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 // QuitApp 完全退出应用（供前端调用）
 func (a *App) QuitApp() {
 	a.shutdownOnce.Do(func() {
-		fmt.Println("AI Companion 正在退出...")
+		fmt.Println("Along 正在退出...")
 
 		a.mu.Lock()
 		a.isShuttingDown = true
@@ -211,7 +257,7 @@ func (a *App) QuitApp() {
 			wruntime.Quit(a.ctx)
 		}
 
-		fmt.Println("AI Companion 已退出")
+		fmt.Println("Along 已退出")
 	})
 }
 
@@ -220,18 +266,65 @@ func (a *App) shutdown(ctx context.Context) {
 	a.QuitApp()
 }
 
-// getDataDir 获取数据存储目录
+// getDataDir 获取数据存储目录（使用项目根目录的 data 目录）
 func (a *App) getDataDir() (string, error) {
-	appData := os.Getenv("APPDATA")
-	if appData == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Dir(exe), nil
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
 	}
-	dir := filepath.Join(appData, "AICompanion")
+
+	// 数据目录：可执行文件旁的 data 目录
+	dir := filepath.Join(filepath.Dir(exe), "data")
+
+	// 检查新目录是否已有数据
+	dbPath := filepath.Join(dir, "companion.db")
+	if _, err := os.Stat(dbPath); err == nil {
+		// 已有数据，直接返回
+		return dir, nil
+	}
+
+	// 需要迁移数据
+	os.MkdirAll(dir, 0755)
+
+	// 按优先级检测旧数据目录
+	oldDirs := []string{
+		filepath.Join(filepath.Dir(exe), "along-pre", "AICompanion"),       // 可执行文件旁的 along-pre/AICompanion
+		filepath.Join(filepath.Dir(exe), "..", "along-pre", "AICompanion"), // 上级目录的 along-pre/AICompanion
+	}
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		oldDirs = append(oldDirs, filepath.Join(appData, "AICompanion")) // %APPDATA%\AICompanion
+	}
+
+	for _, oldDir := range oldDirs {
+		if _, err := os.Stat(filepath.Join(oldDir, "companion.db")); err == nil {
+			fmt.Println("迁移旧数据:", oldDir, "->", dir)
+			a.copyDir(oldDir, dir)
+			break
+		}
+	}
+
 	return dir, nil
+}
+
+// copyDir 递归复制目录内容
+func (a *App) copyDir(src, dst string) {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		if entry.IsDir() {
+			os.MkdirAll(dstPath, 0755)
+			a.copyDir(srcPath, dstPath)
+		} else {
+			data, err := os.ReadFile(srcPath)
+			if err == nil {
+				os.WriteFile(dstPath, data, 0644)
+			}
+		}
+	}
 }
 
 // ensureDirectories 确保必要的目录存在
@@ -247,10 +340,205 @@ func (a *App) ensureDirectories() {
 	}
 }
 
+// initDefaultResearchTask 初始化默认的AI前沿知识调研任务
+func (a *App) initDefaultResearchTask() {
+	if a.automationEngine == nil {
+		fmt.Println("自动化引擎未初始化，跳过默认任务创建")
+		return
+	}
+	a.ensureDefaultTasks()
+}
+
+// ensureDefaultTasks 确保默认任务存在
+func (a *App) ensureDefaultTasks() {
+	researchDir := filepath.Join(a.dataDir, "research_docs")
+	os.MkdirAll(researchDir, 0755)
+
+	var existingID int
+	var existingName string
+	err := a.db.QueryRow(`SELECT id, name FROM automation_tasks WHERE slash_command = ?`, "/research").Scan(&existingID, &existingName)
+
+	config := map[string]interface{}{
+		"query":        "AI前沿技术 2026 research paper arXiv 大模型最新进展 Loop AI Agentic AI 多智能体系统 推理优化 学术研究",
+		"engine":       "duckduckgo",
+		"result_count": 15,
+		"need_summary": true,
+		"output_type":  "file",
+		"file_path":    filepath.Join(researchDir, "ai_research_{{date}}.md"),
+	}
+	configJSON, _ := json.Marshal(config)
+
+	scheduleConfig := map[string]interface{}{
+		"day":  1,
+		"time": "09:00",
+	}
+	scheduleConfigJSON, _ := json.Marshal(scheduleConfig)
+
+	var taskID int
+	if err == nil && existingID > 0 {
+		task := &models.AutomationTask{
+			ID:               existingID,
+			Name:             "AI前沿知识调研",
+			Description:      "每周一上午9点自动联网搜索AI最新技术进展，AI总结后保存为文档",
+			TaskType:         "web_search",
+			Config:           string(configJSON),
+			ScheduleType:     "weekly",
+			ScheduleConfig:   string(scheduleConfigJSON),
+			Enabled:          true,
+			MaxRetries:       2,
+			RetryIntervalSec: 30,
+			SlashCommand:     "/research",
+		}
+		err = a.automationEngine.GetService().UpdateTask(task)
+		if err != nil {
+			fmt.Println("更新调研任务失败:", err)
+			return
+		}
+		taskID = existingID
+		fmt.Println("已更新默认任务: AI前沿知识调研")
+	} else {
+		task := &models.AutomationTask{
+			Name:             "AI前沿知识调研",
+			Description:      "每周一上午9点自动联网搜索AI最新技术进展，AI总结后保存为文档",
+			TaskType:         "web_search",
+			Config:           string(configJSON),
+			ScheduleType:     "weekly",
+			ScheduleConfig:   string(scheduleConfigJSON),
+			Enabled:          true,
+			MaxRetries:       2,
+			RetryIntervalSec: 30,
+			SlashCommand:     "/research",
+		}
+		taskID, err = a.automationEngine.GetService().CreateTask(task)
+		if err != nil {
+			fmt.Println("创建默认调研任务失败:", err)
+			return
+		}
+		fmt.Println("已创建默认任务: AI前沿知识调研")
+	}
+
+	a.automationEngine.ScheduleTask(taskID)
+}
+
+// initTaskTemplates 初始化系统任务模板（7个最终版模板）
+func (a *App) initTaskTemplates() {
+	researchDir := filepath.Join(a.dataDir, "research_docs")
+	os.MkdirAll(researchDir, 0755)
+
+	researchPath := filepath.Join(researchDir, "research_{{date}}.md")
+
+	templates := []struct {
+		Name                  string
+		Icon                  string
+		Description           string
+		TaskType              string
+		DefaultConfig         string
+		DefaultScheduleType   string
+		DefaultScheduleConfig string
+		Steps                 string
+	}{
+		{
+			Name:                  "联网调研",
+			Icon:                  "🔍",
+			Description:           "搜索(web) → 总结(summarize) → 保存文件(file_generation)，定期搜索最新信息并生成报告",
+			TaskType:              "workflow",
+			DefaultConfig:         `{}`,
+			DefaultScheduleType:   "weekly",
+			DefaultScheduleConfig: `{"day": 1, "time": "09:00"}`,
+			Steps: `[
+				{"step_type": "web_search", "name": "搜索", "config": {"query": "", "result_count": 10}, "output_var": "search_results"},
+				{"step_type": "summarize", "name": "总结", "config": {"summary_type": "detailed", "use_raw_from": "search_results"}, "output_var": "summary"},
+				{"step_type": "file_generation", "name": "保存文件", "config": {"file_path": "` + researchPath + `", "content_var": "summary"}}
+			]`,
+		},
+		{
+			Name:                  "周报总结",
+			Icon:                  "📝",
+			Description:           "获取本周对话 → 获取本周任务 → 总结(summarize) → 保存文件，基于对话和任务生成周报",
+			TaskType:              "workflow",
+			DefaultConfig:         `{}`,
+			DefaultScheduleType:   "weekly",
+			DefaultScheduleConfig: `{"day": 5, "time": "18:00"}`,
+			Steps: `[
+				{"step_type": "agent_chat", "name": "生成本周总结报告", "config": {"prompt": "请帮我生成本周的总结报告，内容包括：本周对话摘要、计划进度回顾、里程碑完成情况、打卡记录统计、下周建议。请结合本周的所有对话内容来生成。"}, "output_var": "report"}
+			]`,
+		},
+		{
+			Name:                  "数据备份",
+			Icon:                  "💾",
+			Description:           "定期备份数据库",
+			TaskType:              "backup",
+			DefaultConfig:         `{}`,
+			DefaultScheduleType:   "daily",
+			DefaultScheduleConfig: `{"time": "23:00"}`,
+			Steps:                 "[]",
+		},
+		{
+			Name:                  "每日提醒",
+			Icon:                  "🔔",
+			Description:           "定时消息推送",
+			TaskType:              "reminder",
+			DefaultConfig:         `{"message": "该休息一下了！"}`,
+			DefaultScheduleType:   "daily",
+			DefaultScheduleConfig: `{"time": "10:00"}`,
+			Steps:                 "[]",
+		},
+		{
+			Name:                  "习惯打卡统计",
+			Icon:                  "✅",
+			Description:           "打卡 → 总结 → 通知，统计打卡情况",
+			TaskType:              "habit_checkin",
+			DefaultConfig:         `{}`,
+			DefaultScheduleType:   "daily",
+			DefaultScheduleConfig: `{"time": "22:00"}`,
+			Steps:                 "[]",
+		},
+		{
+			Name:                  "反思复盘",
+			Icon:                  "🧠",
+			Description:           "基于对话和记忆进行定期复盘",
+			TaskType:              "reflection",
+			DefaultConfig:         `{"period": "week"}`,
+			DefaultScheduleType:   "weekly",
+			DefaultScheduleConfig: `{"day": 0, "time": "20:00"}`,
+			Steps:                 "[]",
+		},
+		{
+			Name:                  "自定义工作流",
+			Icon:                  "⚙️",
+			Description:           "从头设计流程",
+			TaskType:              "workflow",
+			DefaultConfig:         `{}`,
+			DefaultScheduleType:   "manual",
+			DefaultScheduleConfig: "{}",
+			Steps:                 "[]",
+		},
+	}
+
+	for _, t := range templates {
+		var existingID int
+		err := a.db.QueryRow(`SELECT id FROM task_templates WHERE name = ? AND is_system = 1`, t.Name).Scan(&existingID)
+		if err == nil && existingID > 0 {
+			continue
+		}
+
+		_, err = a.db.Exec(`INSERT INTO task_templates (name, icon, description, task_type, default_config, default_schedule_type, default_schedule_config, steps, is_system) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+			t.Name, t.Icon, t.Description, t.TaskType, t.DefaultConfig, t.DefaultScheduleType, t.DefaultScheduleConfig, t.Steps)
+		if err != nil {
+			fmt.Printf("创建模板失败 %s: %v\n", t.Name, err)
+		}
+	}
+
+	fmt.Println("已初始化系统任务模板（7个）")
+}
+
 // ==================== 聊天相关 ====================
 
 // SendMessage 发送消息（前端调用）
 func (a *App) SendMessage(content string) (*models.MessageResponse, error) {
+	if a.companionCore == nil {
+		return nil, fmt.Errorf("应用未初始化")
+	}
 	reply, emotion, err := a.companionCore.ProcessMessage(content)
 	if err != nil {
 		return nil, err
@@ -299,6 +587,9 @@ func (a *App) SendMessageStreamInConversation(conversationID int, content string
 	if a.ctx == nil || a.companionCore == nil {
 		return fmt.Errorf("应用未初始化")
 	}
+	if a.conversation == nil {
+		return fmt.Errorf("对话服务未初始化")
+	}
 
 	go func() {
 		fullReply, _, err := a.companionCore.ProcessMessageStreamInConversation(conversationID, content, func(chunk ai.StreamChunk) {
@@ -330,31 +621,49 @@ func (a *App) SendMessageStreamInConversation(conversationID int, content string
 
 // CreateConversation 创建新对话
 func (a *App) CreateConversation(title string) (*models.Conversation, error) {
+	if a.conversation == nil {
+		return nil, fmt.Errorf("对话服务未初始化")
+	}
 	return a.conversation.CreateConversation(title)
 }
 
 // ListConversations 获取所有对话列表
 func (a *App) ListConversations() ([]models.Conversation, error) {
+	if a.conversation == nil {
+		return []models.Conversation{}, nil
+	}
 	return a.conversation.ListConversations()
 }
 
 // GetConversation 获取单个对话
 func (a *App) GetConversation(id int) (*models.Conversation, error) {
+	if a.conversation == nil {
+		return nil, fmt.Errorf("对话服务未初始化")
+	}
 	return a.conversation.GetConversation(id)
 }
 
 // RenameConversation 重命名对话
 func (a *App) RenameConversation(id int, title string) error {
+	if a.conversation == nil {
+		return fmt.Errorf("对话服务未初始化")
+	}
 	return a.conversation.RenameConversation(id, title)
 }
 
 // DeleteConversation 删除对话
 func (a *App) DeleteConversation(id int) error {
+	if a.conversation == nil {
+		return fmt.Errorf("对话服务未初始化")
+	}
 	return a.conversation.DeleteConversation(id)
 }
 
 // GetConversationMessages 获取指定对话的消息
 func (a *App) GetConversationMessages(conversationID int) ([]models.Message, error) {
+	if a.conversation == nil {
+		return []models.Message{}, nil
+	}
 	return a.conversation.GetMessagesByConversationID(conversationID)
 }
 
@@ -365,6 +674,9 @@ func (a *App) GetConversationHistory(date string) ([]models.Message, error) {
 
 // GetConversationDates 获取有对话的所有日期（用于月度总结与历史选择）
 func (a *App) GetConversationDates() ([]string, error) {
+	if a.db == nil {
+		return []string{}, nil
+	}
 	rows, err := a.db.Query("SELECT DISTINCT date FROM conversations ORDER BY date DESC LIMIT 365")
 	if err != nil {
 		return nil, err
@@ -386,26 +698,41 @@ func (a *App) GetConversationDates() ([]string, error) {
 
 // GetMemories 获取记忆列表
 func (a *App) GetMemories(memoryType string) ([]models.Memory, error) {
+	if a.memory == nil {
+		return []models.Memory{}, nil
+	}
 	return a.memory.GetMemories(memoryType)
 }
 
 // GetMemoryCountByType 按类型统计记忆数量
 func (a *App) GetMemoryCountByType() (map[string]int, error) {
+	if a.memory == nil {
+		return map[string]int{}, nil
+	}
 	return a.memory.GetCountByType()
 }
 
 // UpdateMemory 更新记忆
 func (a *App) UpdateMemory(id int, content string) error {
+	if a.memory == nil {
+		return fmt.Errorf("记忆服务未初始化")
+	}
 	return a.memory.UpdateMemory(id, content)
 }
 
 // DeleteMemory 删除记忆
 func (a *App) DeleteMemory(id int) error {
+	if a.memory == nil {
+		return fmt.Errorf("记忆服务未初始化")
+	}
 	return a.memory.DeleteMemory(id)
 }
 
 // AddMemory 添加记忆（前端调用）
 func (a *App) AddMemory(memoryType, content, source string, confidence float64) error {
+	if a.memory == nil {
+		return fmt.Errorf("记忆服务未初始化")
+	}
 	return a.memory.AddMemory(memoryType, content, source, confidence)
 }
 
@@ -413,71 +740,113 @@ func (a *App) AddMemory(memoryType, content, source string, confidence float64) 
 
 // GetGoals 获取所有计划
 func (a *App) GetGoals() ([]models.Goal, error) {
+	if a.plan == nil {
+		return []models.Goal{}, nil
+	}
 	return a.plan.GetAllGoals()
 }
 
 // GetGoalsByType 按类型获取计划
 func (a *App) GetGoalsByType(goalType string) ([]models.Goal, error) {
+	if a.plan == nil {
+		return []models.Goal{}, nil
+	}
 	return a.plan.GetGoalsByType(goalType)
 }
 
 // CreateGoal 创建计划
 func (a *App) CreateGoal(title, description, goalType string) (*models.Goal, error) {
+	if a.plan == nil {
+		return nil, fmt.Errorf("计划服务未初始化")
+	}
 	return a.plan.CreateGoal(title, description, goalType)
 }
 
 // UpdateGoal 更新计划
 func (a *App) UpdateGoal(id int, title, description, status, currentFocus, nextStep, mood string, progress int) error {
+	if a.plan == nil {
+		return fmt.Errorf("计划服务未初始化")
+	}
 	return a.plan.UpdateGoal(id, title, description, status, currentFocus, nextStep, mood, progress)
 }
 
 // DeleteGoal 删除计划
 func (a *App) DeleteGoal(id int) error {
+	if a.plan == nil {
+		return fmt.Errorf("计划服务未初始化")
+	}
 	return a.plan.DeleteGoal(id)
 }
 
 // GetMilestones 获取计划的里程碑
 func (a *App) GetMilestones(goalID int) ([]models.Milestone, error) {
+	if a.plan == nil {
+		return []models.Milestone{}, nil
+	}
 	return a.plan.GetMilestones(goalID)
 }
 
 // AddMilestone 添加里程碑
 func (a *App) AddMilestone(goalID int, title, description string) (*models.Milestone, error) {
+	if a.plan == nil {
+		return nil, fmt.Errorf("计划服务未初始化")
+	}
 	return a.plan.AddMilestone(goalID, title, description)
 }
 
 // UpdateMilestone 更新里程碑
 func (a *App) UpdateMilestone(id int, title, description, status string) error {
+	if a.plan == nil {
+		return fmt.Errorf("计划服务未初始化")
+	}
 	return a.plan.UpdateMilestone(id, title, description, status)
 }
 
 // CompleteMilestone 完成里程碑
 func (a *App) CompleteMilestone(id int, companionComment string) error {
+	if a.plan == nil {
+		return fmt.Errorf("计划服务未初始化")
+	}
 	return a.plan.CompleteMilestone(id, companionComment)
 }
 
 // DeleteMilestone 删除里程碑
 func (a *App) DeleteMilestone(id int) error {
+	if a.plan == nil {
+		return fmt.Errorf("计划服务未初始化")
+	}
 	return a.plan.DeleteMilestone(id)
 }
 
 // GetCheckIns 获取计划的记录
 func (a *App) GetCheckIns(goalID int) ([]models.CheckIn, error) {
+	if a.plan == nil {
+		return []models.CheckIn{}, nil
+	}
 	return a.plan.GetCheckIns(goalID)
 }
 
 // AddCheckIn 添加记录
 func (a *App) AddCheckIn(goalID int, content, mood, companionResponse string) (*models.CheckIn, error) {
+	if a.plan == nil {
+		return nil, fmt.Errorf("计划服务未初始化")
+	}
 	return a.plan.AddCheckIn(goalID, content, mood, companionResponse)
 }
 
 // DeleteCheckIn 删除记录
 func (a *App) DeleteCheckIn(id int) error {
+	if a.plan == nil {
+		return fmt.Errorf("计划服务未初始化")
+	}
 	return a.plan.DeleteCheckIn(id)
 }
 
 // SearchGoals 搜索计划
 func (a *App) SearchGoals(keyword string) ([]models.Goal, error) {
+	if a.plan == nil {
+		return []models.Goal{}, nil
+	}
 	return a.plan.SearchGoals(keyword)
 }
 
@@ -485,60 +854,84 @@ func (a *App) SearchGoals(keyword string) ([]models.Goal, error) {
 
 // GetSettings 获取设置
 func (a *App) GetSettings() (map[string]string, error) {
+	if a.settings == nil {
+		return map[string]string{}, nil
+	}
 	return a.settings.GetAll()
 }
 
 // SaveSetting 保存设置
 func (a *App) SaveSetting(key, value string) error {
-	err := a.settings.Set(key, value)
-	if err != nil {
-		return err
+	if a.settings == nil {
+		return fmt.Errorf("设置服务未初始化")
 	}
-	// 如果保存的是 API Key，更新 AI 客户端
-	if key == "api_key" && value != "" {
-		if a.aiClient != nil {
-			a.aiClient.SetAPIKey(value)
+	return a.settings.Set(key, value)
+}
+
+// setupSettingHooks 注册设置变更钩子（副作用处理）
+func (a *App) setupSettingHooks() {
+	if a.settings == nil {
+		return
+	}
+
+	// API Key 变更时更新 AI 客户端
+	a.settings.OnChange("api_key", func(key, oldValue, newValue string) error {
+		if a.aiClient != nil && newValue != "" {
+			a.aiClient.SetAPIKey(newValue)
 		}
-	}
-	// 如果保存的是 api_provider，重新初始化客户端
-	if key == "api_provider" && value != "" {
+		return nil
+	})
+
+	// API Provider 变更时重新初始化客户端
+	a.settings.OnChange("api_provider", func(key, oldValue, newValue string) error {
+		if newValue == "" {
+			return nil
+		}
 		apiKey, _ := a.settings.Get("api_key")
 		if a.aiClient != nil {
-			a.aiClient.SetProvider(value)
+			a.aiClient.SetProvider(newValue)
 		} else {
-			a.aiClient = ai.NewClient(value, apiKey)
+			a.aiClient = ai.NewClient(newValue, apiKey)
 		}
-		// 重建 CompanionCore 让它使用新 client
 		if a.companionCore != nil {
 			a.companionCore.UpdateAIClient(a.aiClient)
 		}
-	}
-	// 开机启动
-	if key == "auto_start" {
-		enabled := value == "true" || value == "1"
+		return nil
+	})
+
+	// 开机启动变更
+	a.settings.OnChange("auto_start", func(key, oldValue, newValue string) error {
+		enabled := newValue == "true" || newValue == "1"
 		if err := SetAutoStart(enabled); err != nil {
 			fmt.Println("设置开机启动失败:", err)
 		}
-	}
-	// 系统托盘
-	if key == "system_tray_enabled" {
-		// 只在禁用时停止托盘，启用需要重启应用生效
-		if value == "false" || value == "0" {
+		return nil
+	})
+
+	// 系统托盘变更
+	a.settings.OnChange("system_tray_enabled", func(key, oldValue, newValue string) error {
+		if newValue == "false" || newValue == "0" {
 			StopTray()
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // ==================== 观察与复盘 ====================
 
 // GetObservations 获取观察列表
 func (a *App) GetObservations() ([]models.Observation, error) {
+	if a.memory == nil {
+		return []models.Observation{}, nil
+	}
 	return a.memory.GetObservations()
 }
 
 // GenerateReflection 生成复盘
 func (a *App) GenerateReflection(period string) (*models.Reflection, error) {
+	if a.companionCore == nil {
+		return nil, fmt.Errorf("应用未初始化")
+	}
 	return a.companionCore.GenerateReflection(period)
 }
 
@@ -551,6 +944,10 @@ func (a *App) GetCompanionStatus() (*models.CompanionStatus, error) {
 		Mood:       "ready",
 		LastSeen:   time.Now().Format("2006-01-02 15:04"),
 		TrustLevel: 75,
+	}
+
+	if a.conversation == nil || a.memory == nil {
+		return status, nil
 	}
 
 	// 根据最近对话计算情绪
@@ -614,15 +1011,32 @@ func containsAny(s string, keywords []string) bool {
 
 // ExportData 导出数据（返回 JSON 路径）
 func (a *App) ExportData() (string, error) {
+	if a.db == nil {
+		return "", fmt.Errorf("数据库未初始化")
+	}
+
 	exportPath := filepath.Join(a.dataDir, "export.json")
 
 	// 导出所有数据库数据
-	memories, _ := a.memory.GetMemories("")
-	goals, _ := a.plan.GetAllGoals()
-	settings, _ := a.settings.GetAll()
-	observations, _ := a.memory.GetObservations()
-	highlights, _ := a.GetHighlights()
-	reflections, _ := a.GetReflections()
+	var memories []models.Memory
+	var goals []models.Goal
+	var settings map[string]string
+	var observations []models.Observation
+	var highlights []models.Highlight
+	var reflections []models.Reflection
+
+	if a.memory != nil {
+		memories, _ = a.memory.GetMemories("")
+		observations, _ = a.memory.GetObservations()
+	}
+	if a.plan != nil {
+		goals, _ = a.plan.GetAllGoals()
+	}
+	if a.settings != nil {
+		settings, _ = a.settings.GetAll()
+	}
+	highlights, _ = a.GetHighlights()
+	reflections, _ = a.GetReflections()
 
 	// 导出所有对话和消息
 	conversations, _ := a.getAllConversations()
@@ -726,9 +1140,22 @@ func (a *App) exportConversationFiles() map[string]string {
 
 // DeleteAllData 删除所有数据
 func (a *App) DeleteAllData() error {
-	// 清空数据库表
+	if a.db == nil {
+		return fmt.Errorf("数据库未初始化")
+	}
+
+	// 使用白名单验证表名，防止 SQL 注入
+	allowedTables := map[string]bool{
+		"memories": true, "conversations": true, "messages": true,
+		"goals": true, "milestones": true, "check_ins": true,
+		"observations": true, "highlights": true, "reflections": true,
+	}
+
 	tables := []string{"memories", "conversations", "messages", "goals", "milestones", "check_ins", "observations", "highlights", "reflections"}
 	for _, table := range tables {
+		if !allowedTables[table] {
+			continue
+		}
 		a.db.Exec("DELETE FROM " + table)
 	}
 
@@ -751,6 +1178,9 @@ func (a *App) DeleteAllData() error {
 
 // GetHighlights 获取高光回忆
 func (a *App) GetHighlights() ([]models.Highlight, error) {
+	if a.db == nil {
+		return []models.Highlight{}, nil
+	}
 	rows, err := a.db.Query("SELECT id, title, description, date, memory_ids, user_marked, created_at FROM highlights ORDER BY date DESC")
 	if err != nil {
 		return nil, err
@@ -800,6 +1230,9 @@ func (a *App) DeleteHighlight(id int) error {
 
 // GetReflections 获取复盘历史
 func (a *App) GetReflections() ([]models.Reflection, error) {
+	if a.db == nil {
+		return []models.Reflection{}, nil
+	}
 	rows, err := a.db.Query("SELECT id, period_start, period_end, growth_analysis, relationship_analysis, project_review, observations, created_at FROM reflections ORDER BY created_at DESC")
 	if err != nil {
 		return nil, err
@@ -932,6 +1365,9 @@ func (a *App) ToolOpenBrowser(url string) map[string]interface{} {
 
 // IsOnboardingComplete 检查是否已完成引导
 func (a *App) IsOnboardingComplete() (bool, error) {
+	if a.settings == nil {
+		return false, fmt.Errorf("设置服务未初始化")
+	}
 	value, err := a.settings.Get("onboarding_completed")
 	if err != nil {
 		return false, err
@@ -941,6 +1377,9 @@ func (a *App) IsOnboardingComplete() (bool, error) {
 
 // CompleteOnboarding 完成引导流程
 func (a *App) CompleteOnboarding(userName string) error {
+	if a.settings == nil {
+		return fmt.Errorf("设置服务未初始化")
+	}
 	// 保存用户名字
 	if userName != "" {
 		if err := a.settings.Set("user_name", userName); err != nil {
@@ -953,6 +1392,9 @@ func (a *App) CompleteOnboarding(userName string) error {
 
 // GetUserName 获取用户名字
 func (a *App) GetUserName() (string, error) {
+	if a.settings == nil {
+		return "", nil
+	}
 	return a.settings.Get("user_name")
 }
 
@@ -1078,26 +1520,33 @@ func (a *App) GetMoodHistory() ([]map[string]string, error) {
 
 // GetAutomationTasks 获取自动化任务列表
 func (a *App) GetAutomationTasks(taskType string) ([]models.AutomationTask, error) {
+	if a.automationEngine == nil {
+		return []models.AutomationTask{}, nil
+	}
 	return a.automationEngine.GetService().GetTasks(taskType)
 }
 
 // GetAutomationTask 获取单个自动化任务
 func (a *App) GetAutomationTask(id int) (*models.AutomationTask, error) {
+	if a.automationEngine == nil {
+		return nil, fmt.Errorf("自动化引擎未初始化")
+	}
 	return a.automationEngine.GetService().GetTask(id)
 }
 
 // CreateAutomationTask 创建自动化任务
-func (a *App) CreateAutomationTask(name, description, taskType, config, scheduleType, scheduleConfig string, enabled bool) (int, error) {
+func (a *App) CreateAutomationTask(name, description, taskType, config, scheduleType, scheduleConfig string, enabled bool, slashCommand string) (int, error) {
 	task := &models.AutomationTask{
-		Name:            name,
-		Description:     description,
-		TaskType:        taskType,
-		Config:          config,
-		ScheduleType:    scheduleType,
-		ScheduleConfig:  scheduleConfig,
-		Enabled:         enabled,
-		MaxRetries:      2,
+		Name:             name,
+		Description:      description,
+		TaskType:         taskType,
+		Config:           config,
+		ScheduleType:     scheduleType,
+		ScheduleConfig:   scheduleConfig,
+		Enabled:          enabled,
+		MaxRetries:       2,
 		RetryIntervalSec: 30,
+		SlashCommand:     slashCommand,
 	}
 	id, err := a.automationEngine.GetService().CreateTask(task)
 	if err != nil {
@@ -1111,18 +1560,19 @@ func (a *App) CreateAutomationTask(name, description, taskType, config, schedule
 }
 
 // UpdateAutomationTask 更新自动化任务
-func (a *App) UpdateAutomationTask(id int, name, description, taskType, config, scheduleType, scheduleConfig string, enabled bool) error {
+func (a *App) UpdateAutomationTask(id int, name, description, taskType, config, scheduleType, scheduleConfig string, enabled bool, slashCommand string) error {
 	task := &models.AutomationTask{
-		ID:              id,
-		Name:            name,
-		Description:     description,
-		TaskType:        taskType,
-		Config:          config,
-		ScheduleType:    scheduleType,
-		ScheduleConfig:  scheduleConfig,
-		Enabled:         enabled,
-		MaxRetries:      2,
+		ID:               id,
+		Name:             name,
+		Description:      description,
+		TaskType:         taskType,
+		Config:           config,
+		ScheduleType:     scheduleType,
+		ScheduleConfig:   scheduleConfig,
+		Enabled:          enabled,
+		MaxRetries:       2,
 		RetryIntervalSec: 30,
+		SlashCommand:     slashCommand,
 	}
 	err := a.automationEngine.GetService().UpdateTask(task)
 	if err != nil {
@@ -1202,6 +1652,74 @@ func (a *App) AddAutomationDependency(taskID, dependsOnID int, condition string)
 // RemoveAutomationDependency 删除任务依赖
 func (a *App) RemoveAutomationDependency(id int) error {
 	return a.automationEngine.GetService().RemoveDependency(id)
+}
+
+// GetTaskTemplates 获取任务模板列表
+func (a *App) GetTaskTemplates() ([]models.TaskTemplate, error) {
+	if a.db == nil {
+		return []models.TaskTemplate{}, nil
+	}
+	query := `SELECT id, name, COALESCE(icon, ''), COALESCE(description, ''), task_type,
+				default_config, default_schedule_type, default_schedule_config, steps, is_system,
+				COALESCE(created_at, ''), COALESCE(updated_at, '')
+			  FROM task_templates ORDER BY is_system DESC, id ASC`
+
+	rows, err := a.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var templates []models.TaskTemplate
+	for rows.Next() {
+		var t models.TaskTemplate
+		if err := rows.Scan(&t.ID, &t.Name, &t.Icon, &t.Description, &t.TaskType,
+			&t.DefaultConfig, &t.DefaultScheduleType, &t.DefaultScheduleConfig,
+			&t.Steps, &t.IsSystem, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			continue
+		}
+		templates = append(templates, t)
+	}
+	return templates, nil
+}
+
+// GetTaskTemplate 获取单个模板
+func (a *App) GetTaskTemplate(id int) (*models.TaskTemplate, error) {
+	if a.db == nil {
+		return nil, fmt.Errorf("数据库未初始化")
+	}
+	query := `SELECT id, name, COALESCE(icon, ''), COALESCE(description, ''), task_type,
+				default_config, default_schedule_type, default_schedule_config, steps, is_system,
+				COALESCE(created_at, ''), COALESCE(updated_at, '')
+			  FROM task_templates WHERE id = ?`
+
+	row := a.db.QueryRow(query, id)
+	var t models.TaskTemplate
+	err := row.Scan(&t.ID, &t.Name, &t.Icon, &t.Description, &t.TaskType,
+		&t.DefaultConfig, &t.DefaultScheduleType, &t.DefaultScheduleConfig,
+		&t.Steps, &t.IsSystem, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("模板 %d 不存在", id)
+		}
+		return nil, err
+	}
+	return &t, nil
+}
+
+// CreateTaskFromTemplate 从模板创建任务
+func (a *App) CreateTaskFromTemplate(templateID int, name, description string, scheduleType, scheduleConfig, slashCommand string) (int, error) {
+	id, err := a.automationEngine.GetService().CreateTaskFromTemplate(templateID, name, description, scheduleType, scheduleConfig, slashCommand)
+	if err != nil {
+		return 0, err
+	}
+	a.automationEngine.ScheduleTask(id)
+	return id, nil
+}
+
+// GetTaskBySlashCommand 根据斜杠命令获取任务
+func (a *App) GetTaskBySlashCommand(command string) (*models.AutomationTask, error) {
+	return a.automationEngine.GetService().GetTaskBySlashCommand(command)
 }
 
 // GetTaskConfigSchema 获取任务类型配置表单Schema
@@ -1297,7 +1815,7 @@ func (a *App) GenerateDocument(title, content, template string) (map[string]inte
 	}
 
 	return map[string]interface{}{
-		"content":  result.Content,
+		"content":   result.Content,
 		"file_path": filePath,
 	}, nil
 }

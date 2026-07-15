@@ -161,6 +161,13 @@ function formatScheduleText(task) {
     case 'daily':
       return `每天 ${cfg.time || '09:00'}`
     case 'weekly': {
+      if (Array.isArray(cfg.days) && cfg.days.length > 0) {
+        const dayLabels = cfg.days.map(d => {
+          const day = WEEKDAYS.find((w) => w.value === d)
+          return day ? day.label : `周${d}`
+        }).sort()
+        return `${dayLabels.join('、')} ${cfg.time || '09:00'}`
+      }
       const day = WEEKDAYS.find((w) => w.value === (cfg.day ?? 1))
       return `每${day ? day.label : '周一'} ${cfg.time || '09:00'}`
     }
@@ -410,20 +417,37 @@ function ScheduleEditor({ scheduleType, scheduleConfig, setScheduleType, setSche
       )}
 
       {scheduleType === 'weekly' && (
-        <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-3">
           <div>
-            <label className={labelCls}>星期</label>
-            <select
-              value={scheduleConfig.day ?? 1}
-              onChange={(e) => update({ day: Number(e.target.value) })}
-              className={inputCls}
-            >
-              {WEEKDAYS.map((w) => (
-                <option key={w.value} value={w.value}>
-                  {w.label}
-                </option>
-              ))}
-            </select>
+            <label className={labelCls}>星期（可多选）</label>
+            <div className="flex flex-wrap gap-2">
+              {WEEKDAYS.map((w) => {
+                const daysArr = Array.isArray(scheduleConfig.days) ? scheduleConfig.days : []
+                const active = daysArr.includes(w.value) || scheduleConfig.day === w.value
+                const handleClick = () => {
+                  const current = Array.isArray(scheduleConfig.days) ? [...scheduleConfig.days] : (scheduleConfig.day !== undefined ? [scheduleConfig.day] : [])
+                  if (active) {
+                    update({ days: current.filter(d => d !== w.value), day: undefined })
+                  } else {
+                    update({ days: [...current, w.value], day: undefined })
+                  }
+                }
+                return (
+                  <button
+                    key={w.value}
+                    type="button"
+                    onClick={handleClick}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
+                      active
+                        ? 'bg-primary-500/15 border-primary-500 text-primary-400'
+                        : 'bg-bg border-border text-text-muted hover:border-border-strong hover:text-text'
+                    }`}
+                  >
+                    {w.label}
+                  </button>
+                )
+              })}
+            </div>
           </div>
           <div>
             <label className={labelCls}>执行时间</label>
@@ -553,6 +577,22 @@ function TaskCard({
               >
                 {isEnabled ? '运行中' : '已暂停'}
               </span>
+              {task.last_run_at && task.last_run_at !== '0001-01-01T00:00:00Z' && (
+                <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${
+                  task.status === 'success'
+                    ? 'bg-green-500/10 text-green-400'
+                    : task.status === 'failed'
+                    ? 'bg-red-500/10 text-red-400'
+                    : 'bg-gray-500/10 text-gray-400'
+                }`}>
+                  {task.status === 'success' ? (
+                    <CheckCircle className="w-3 h-3" />
+                  ) : task.status === 'failed' ? (
+                    <AlertCircle className="w-3 h-3" />
+                  ) : null}
+                  {task.status === 'success' ? '成功' : task.status === 'failed' ? '失败' : '未知'}
+                </span>
+              )}
             </div>
 
             {task.description && (
@@ -791,25 +831,27 @@ function ExecutionItem({ exec, isWorkflow }) {
 
 // ---------- 新建/编辑任务弹窗（多步骤） ----------
 function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
-  const [step, setStep] = useState(1) // 1:选类型 2:配置 3:调度
+  const [step, setStep] = useState(0)
+  const [selectedTemplate, setSelectedTemplate] = useState(null)
+  const [templates, setTemplates] = useState([])
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
-  const [taskType, setTaskType] = useState('agent_chat')
+  const [taskType, setTaskType] = useState('workflow')
   const [config, setConfig] = useState({})
-  const [schema, setSchema] = useState([])
-  const [loadingSchema, setLoadingSchema] = useState(false)
   const [scheduleType, setScheduleType] = useState('daily')
   const [scheduleConfig, setScheduleConfig] = useState({ time: '09:00' })
   const [enabled, setEnabled] = useState(true)
+  const [slashCommand, setSlashCommand] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [steps, setSteps] = useState([])
+  const [loadingTemplates, setLoadingTemplates] = useState(false)
 
-  // 重置/初始化
   useEffect(() => {
     if (!isOpen) return
     if (editingTask) {
       setName(editingTask.name || '')
       setDescription(editingTask.description || '')
-      setTaskType(editingTask.task_type || 'agent_chat')
+      setTaskType(editingTask.task_type || 'workflow')
       try {
         setConfig(editingTask.config ? JSON.parse(editingTask.config) : {})
       } catch (e) {
@@ -822,53 +864,69 @@ function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
         setScheduleConfig({ time: '09:00' })
       }
       setEnabled(editingTask.enabled !== false)
-      setStep(2)
+      setSlashCommand(editingTask.slash_command || '')
+      try {
+        setSteps(editingTask.steps ? JSON.parse(editingTask.steps) : [])
+      } catch (e) {
+        setSteps([])
+      }
+      setSelectedTemplate(null)
+      setStep(1)
     } else {
       setName('')
       setDescription('')
-      setTaskType('agent_chat')
+      setTaskType('workflow')
       setConfig({})
+      setSteps([])
       setScheduleType('daily')
       setScheduleConfig({ time: '09:00' })
       setEnabled(true)
-      setStep(1)
+      setSlashCommand('')
+      setSelectedTemplate(null)
+      setStep(0)
+      loadTemplates()
     }
   }, [isOpen, editingTask])
 
-  // 加载 schema
-  useEffect(() => {
-    if (!isOpen || taskType === 'workflow') {
-      setSchema([])
-      return
+  const loadTemplates = async () => {
+    if (!hasBackend()) return
+    setLoadingTemplates(true)
+    try {
+      const result = await window.go.main.App.GetTaskTemplates()
+      setTemplates(Array.isArray(result) ? result : [])
+    } catch (e) {
+      console.error('加载模板失败:', e)
+      setTemplates([])
+    } finally {
+      setLoadingTemplates(false)
     }
-    setLoadingSchema(true)
-    setSchema([])
-    if (!hasBackend()) {
-      setLoadingSchema(false)
-      return
+  }
+
+  const handleSelectTemplate = (template) => {
+    setSelectedTemplate(template)
+    setName(template.name || '')
+    setDescription(template.description || '')
+    setTaskType(template.task_type || 'workflow')
+    setScheduleType(template.default_schedule_type || 'daily')
+    try {
+      const cfg = template.default_config ? JSON.parse(template.default_config) : {}
+      setConfig(cfg)
+    } catch (e) {
+      setConfig({})
     }
-    window.go.main.App
-      .GetTaskConfigSchema(taskType)
-      .then((result) => {
-        setSchema(Array.isArray(result) ? result : [])
-        // 初始化默认值
-        const initCfg = {}
-        ;(Array.isArray(result) ? result : []).forEach((f) => {
-          if (f.default !== undefined && f.default !== '') {
-            if (f.type === 'number') initCfg[f.key] = Number(f.default)
-            else if (f.type === 'boolean') initCfg[f.key] = f.default === 'true'
-            else initCfg[f.key] = f.default
-          }
-        })
-        // 保留已有 config 值
-        setConfig((prev) => ({ ...initCfg, ...prev }))
-      })
-      .catch((e) => {
-        console.error('加载schema失败:', e)
-        setSchema([])
-      })
-      .finally(() => setLoadingSchema(false))
-  }, [isOpen, taskType])
+    try {
+      const scfg = template.default_schedule_config ? JSON.parse(template.default_schedule_config) : { time: '09:00' }
+      setScheduleConfig(scfg)
+    } catch (e) {
+      setScheduleConfig({ time: '09:00' })
+    }
+    try {
+      const s = template.steps ? JSON.parse(template.steps) : []
+      setSteps(s)
+    } catch (e) {
+      setSteps([])
+    }
+  }
 
   if (!isOpen) return null
 
@@ -879,7 +937,7 @@ function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
     }
     setSubmitting(true)
     try {
-      const configStr = taskType === 'workflow' ? '{}' : JSON.stringify(config)
+      const configStr = JSON.stringify(config)
       const scheduleConfigStr = JSON.stringify(scheduleConfig)
       await onSubmit({
         name: name.trim(),
@@ -889,6 +947,8 @@ function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
         scheduleType,
         scheduleConfig: scheduleConfigStr,
         enabled,
+        slashCommand: slashCommand.trim(),
+        templateID: selectedTemplate ? selectedTemplate.id : null,
       })
       onClose()
     } catch (e) {
@@ -899,10 +959,13 @@ function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
   }
 
   const canGoNext = () => {
-    if (step === 1) return !!taskType
-    if (step === 2) return !!name.trim()
+    if (step === 0) return !!selectedTemplate
+    if (step === 1) return !!name.trim()
+    if (step === 2) return true
     return true
   }
+
+  const isCustomWorkflow = selectedTemplate?.name === '自定义工作流' || taskType === 'workflow'
 
   return (
     <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4 backdrop-blur-sm">
@@ -914,11 +977,11 @@ function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
               {editingTask ? '编辑自动化任务' : '新建自动化任务'}
             </h3>
             <div className="flex items-center gap-1.5 text-xs text-text-muted">
-              <span className={step >= 1 ? 'text-primary-400' : ''}>类型</span>
+              <span className={step >= 0 ? 'text-primary-400' : ''}>模板</span>
               <ChevronRight className="w-3 h-3" />
-              <span className={step >= 2 ? 'text-primary-400' : ''}>配置</span>
+              <span className={step >= 1 ? 'text-primary-400' : ''}>配置</span>
               <ChevronRight className="w-3 h-3" />
-              <span className={step >= 3 ? 'text-primary-400' : ''}>调度</span>
+              <span className={step >= 2 ? 'text-primary-400' : ''}>调度</span>
             </div>
           </div>
           <button
@@ -931,39 +994,42 @@ function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
 
         {/* 内容 */}
         <div className="flex-1 overflow-y-auto p-4">
-          {step === 1 && (
+          {step === 0 && (
             <div>
-              <label className="block text-sm font-medium text-text mb-3">选择任务类型</label>
-              <div className="grid grid-cols-2 gap-2">
-                {TASK_TYPES.map((t) => {
-                  const Icon = t.icon
-                  const active = taskType === t.id
-                  return (
+              <label className="block text-sm font-medium text-text mb-3">选择模板</label>
+              {loadingTemplates ? (
+                <div className="flex items-center justify-center py-12 text-text-subtle text-sm">
+                  <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                  加载模板中...
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {templates.map((t) => (
                     <button
                       key={t.id}
-                      type="button"
-                      onClick={() => setTaskType(t.id)}
-                      className={`flex items-start gap-3 p-3 rounded-lg text-left transition-all border ${
-                        active
-                          ? 'bg-primary-500/10 border-primary-500 ring-1 ring-primary-500/20'
-                          : 'bg-bg border-border hover:border-border-strong'
+                      onClick={() => handleSelectTemplate(t)}
+                      className={`p-4 border rounded-xl text-left transition-all ${
+                        selectedTemplate?.id === t.id
+                          ? 'border-primary-500 bg-primary-500/10 ring-2 ring-primary-500/20'
+                          : 'border-border hover:border-border-strong hover:bg-surface-subtle'
                       }`}
                     >
-                      <div className={`w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 ${t.iconBg}`}>
-                        <Icon className="w-4 h-4" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="font-medium text-text text-sm">{t.label}</div>
-                        <div className="text-xs text-text-muted mt-0.5 line-clamp-2">{t.desc}</div>
-                      </div>
+                      <div className="text-3xl mb-3">{t.icon}</div>
+                      <div className="font-medium text-text mb-1">{t.name}</div>
+                      <div className="text-xs text-text-muted line-clamp-2">{t.description}</div>
                     </button>
-                  )
-                })}
-              </div>
+                  ))}
+                </div>
+              )}
+              {templates.length === 0 && !loadingTemplates && (
+                <div className="text-center py-8 text-text-subtle text-sm">
+                  暂无模板，请联系管理员添加
+                </div>
+              )}
             </div>
           )}
 
-          {step === 2 && (
+          {step === 1 && (
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-text mb-1.5">任务名称</label>
@@ -987,26 +1053,57 @@ function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
                 />
               </div>
 
-              {taskType !== 'workflow' ? (
+              {!isCustomWorkflow && steps.length > 0 && (
                 <div>
-                  <label className="block text-sm font-medium text-text mb-3">任务配置</label>
-                  {loadingSchema ? (
-                    <div className="flex items-center justify-center py-6 text-text-subtle text-sm">
-                      <Loader2 className="w-4 h-4 animate-spin mr-2" />
-                      加载配置项...
-                    </div>
-                  ) : (
-                    <ConfigForm fields={schema} config={config} setConfig={setConfig} />
-                  )}
+                  <label className="block text-sm font-medium text-text mb-3">任务步骤预览</label>
+                  <div className="space-y-2 bg-surface-subtle rounded-lg p-3">
+                    {steps.map((s, idx) => (
+                      <div key={idx} className="flex items-center gap-3 text-sm">
+                        <span className="w-6 h-6 flex items-center justify-center bg-primary-500/10 text-primary-400 text-xs font-medium rounded-full flex-shrink-0">
+                          {idx + 1}
+                        </span>
+                        <span className="text-text">{s.name || `步骤${idx + 1}`}</span>
+                        <span className="text-xs text-text-muted">· {s.step_type || 'agent'}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              ) : (
+              )}
+
+              {isCustomWorkflow && (
                 <div className="text-sm text-text-subtle bg-violet-500/10 border border-violet-500/20 rounded-lg p-3 flex items-start gap-2">
                   <Info className="w-4 h-4 text-violet-400 flex-shrink-0 mt-0.5" />
                   <span>
-                    流程类型任务的步骤需在创建后通过「编辑流程」按钮配置。这里只需填写名称和描述。
+                    自定义工作流的步骤需在创建后通过「编辑流程」按钮配置。这里只需填写名称和描述。
                   </span>
                 </div>
               )}
+
+              <div>
+                <label className="block text-sm font-medium text-text mb-1.5">斜杠命令</label>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm bg-bg px-3 py-2.5 rounded-l-lg border border-r-0 border-border text-text-muted">/</span>
+                  <input
+                    type="text"
+                    value={slashCommand}
+                    onChange={(e) => setSlashCommand(e.target.value)}
+                    placeholder="research"
+                    className="flex-1 px-3 py-2.5 bg-bg border border-border rounded-r-lg text-sm focus:outline-none focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 transition-all"
+                  />
+                </div>
+                <p className="text-xs text-text-subtle mt-1">对话中输入 /命令名 可直接触发此任务</p>
+              </div>
+            </div>
+          )}
+
+          {step === 2 && (
+            <div className="space-y-4">
+              <ScheduleEditor
+                scheduleType={scheduleType}
+                scheduleConfig={scheduleConfig}
+                setScheduleType={setScheduleType}
+                setScheduleConfig={setScheduleConfig}
+              />
 
               <div className="flex items-center gap-2 p-3 bg-surface-subtle rounded-lg">
                 <button
@@ -1028,21 +1125,12 @@ function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
               </div>
             </div>
           )}
-
-          {step === 3 && (
-            <ScheduleEditor
-              scheduleType={scheduleType}
-              scheduleConfig={scheduleConfig}
-              setScheduleType={setScheduleType}
-              setScheduleConfig={setScheduleConfig}
-            />
-          )}
         </div>
 
         {/* 底部按钮 */}
         <div className="flex items-center justify-between px-4 py-3 border-t border-border">
           <div>
-            {step > 1 && (
+            {step > 0 && (!editingTask || step > 1) && (
               <button
                 type="button"
                 onClick={() => setStep(step - 1)}
@@ -1061,7 +1149,7 @@ function TaskWizard({ isOpen, onClose, onSubmit, editingTask }) {
             >
               取消
             </button>
-            {step < 3 ? (
+            {step < 2 ? (
               <button
                 type="button"
                 onClick={() => setStep(step + 1)}
@@ -1725,7 +1813,6 @@ function AutomationPage() {
   const [tasks, setTasks] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [filter, setFilter] = useState('all')
   const [expandedId, setExpandedId] = useState(null)
   const [executions, setExecutions] = useState([])
   const [loadingExecutions, setLoadingExecutions] = useState(false)
@@ -1791,18 +1878,31 @@ function AutomationPage() {
         data.config,
         data.scheduleType,
         data.scheduleConfig,
-        data.enabled
+        data.enabled,
+        data.slashCommand || ''
       )
     } else {
-      await window.go.main.App.CreateAutomationTask(
-        data.name,
-        data.description,
-        data.taskType,
-        data.config,
-        data.scheduleType,
-        data.scheduleConfig,
-        data.enabled
-      )
+      if (data.templateID) {
+        await window.go.main.App.CreateTaskFromTemplate(
+          data.templateID,
+          data.name,
+          data.description,
+          data.scheduleType,
+          data.scheduleConfig,
+          data.slashCommand || ''
+        )
+      } else {
+        await window.go.main.App.CreateAutomationTask(
+          data.name,
+          data.description,
+          data.taskType,
+          data.config,
+          data.scheduleType,
+          data.scheduleConfig,
+          data.enabled,
+          data.slashCommand || ''
+        )
+      }
     }
     setEditingTask(null)
     loadTasks()
@@ -1868,12 +1968,7 @@ function AutomationPage() {
   ).length
 
   // 过滤
-  const filteredTasks = filter === 'all' ? tasks : tasks.filter((t) => t.task_type === filter)
-
-  const filters = [
-    { id: 'all', label: '全部' },
-    ...TASK_TYPES.map((t) => ({ id: t.id, label: t.label })),
-  ]
+  const filteredTasks = tasks
 
   return (
     <div className="h-full flex flex-col bg-bg">
@@ -1914,26 +2009,6 @@ function AutomationPage() {
             <span className="text-xs text-text-muted">今日执行: {todayCount}</span>
           </div>
         </div>
-
-        {/* 类型筛选 */}
-        <div className="flex flex-wrap items-center gap-1.5 mt-3">
-          {filters.map((f) => {
-            const active = filter === f.id
-            return (
-              <button
-                key={f.id}
-                onClick={() => setFilter(f.id)}
-                className={`px-2.5 py-1 rounded-full text-xs font-medium transition-all ${
-                  active
-                    ? 'bg-primary-500 text-white'
-                    : 'bg-surface-subtle text-text-muted hover:text-text hover:bg-surface-hover'
-                }`}
-              >
-                {f.label}
-              </button>
-            )
-          })}
-        </div>
       </div>
 
       {/* 错误提示 */}
@@ -1959,12 +2034,8 @@ function AutomationPage() {
             <div className="w-16 h-16 rounded-full bg-surface-subtle flex items-center justify-center mb-4">
               <Zap className="w-8 h-8 opacity-50" />
             </div>
-            <p className="text-text-muted">
-              {filter === 'all' ? '暂无自动化任务' : '该类型暂无任务'}
-            </p>
-            <p className="text-sm mt-1">
-              {filter === 'all' ? '点击上方按钮创建第一个任务' : '切换类型或创建新任务'}
-            </p>
+            <p className="text-text-muted">暂无自动化任务</p>
+            <p className="text-sm mt-1">点击上方按钮创建第一个任务</p>
             <div className="mt-4 flex items-center gap-2 text-xs text-text-subtle">
               <Info className="w-3.5 h-3.5" />
               <span>支持对话/搜索/报告/备份/提醒/监控/打卡/复习/清理/流程</span>

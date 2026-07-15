@@ -23,8 +23,8 @@ func NewToolAgent(client *ai.Client) *ToolAgent {
 
 // ToolRequest 工具请求
 type ToolRequest struct {
-	Action  string                 `json:"action"`
-	Params  map[string]interface{} `json:"params"`
+	Action string                 `json:"action"`
+	Params map[string]interface{} `json:"params"`
 }
 
 // ToolResponse 工具响应
@@ -180,9 +180,9 @@ func (ta *ToolAgent) WriteFile(path, content string) ToolResponse {
 	return ToolResponse{
 		Success: true,
 		Data: map[string]interface{}{
-			"path":     path,
-			"size":     len(content),
-			"message":  "文件写入成功",
+			"path":    path,
+			"size":    len(content),
+			"message": "文件写入成功",
 		},
 	}
 }

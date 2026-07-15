@@ -1,8 +1,8 @@
 package core
 
 import (
-	"ai-companion/internal/ai"
 	"ai-companion/internal/agents"
+	"ai-companion/internal/ai"
 	"ai-companion/internal/models"
 	"ai-companion/internal/services"
 	"fmt"
@@ -34,6 +34,8 @@ type CompanionCore struct {
 	memoryService       *services.MemoryService
 	conversationService *services.ConversationService
 	planService         *services.PlanService
+	automationService   *services.AutomationService
+	taskExecutor        TaskExecutor
 
 	emotionAgent        *agents.EmotionAgent
 	plannerAgent        *agents.PlannerAgent
@@ -44,6 +46,11 @@ type CompanionCore struct {
 	webAgent            *agents.WebAgent
 	summarizeAgent      *agents.SummarizeAgent
 	fileGenerationAgent *agents.FileGenerationAgent
+	techAnalysisAgent   *agents.TechAnalysisAgent
+}
+
+type TaskExecutor interface {
+	ExecuteTask(taskID int) *models.AutomationExecution
 }
 
 func NewCompanionCore(
@@ -63,12 +70,13 @@ func NewCompanionCore(
 	cc.emotionAgent = agents.NewEmotionAgent(aiClient)
 	cc.plannerAgent = agents.NewPlannerAgent(aiClient)
 	cc.memoryAgent = agents.NewMemoryAgent(aiClient, memoryService)
-	cc.researchAgent = agents.NewResearchAgent(aiClient)
 	cc.reflectionAgent = agents.NewReflectionAgent(aiClient, memoryService, conversationService)
 	cc.toolAgent = agents.NewToolAgent(aiClient)
 	cc.webAgent = agents.NewWebAgent(aiClient)
-	cc.summarizeAgent = agents.NewSummarizeAgent(aiClient)
+	cc.summarizeAgent = agents.NewSummarizeAgent(aiClient, cc.webAgent)
 	cc.fileGenerationAgent = agents.NewFileGenerationAgent(aiClient)
+	cc.techAnalysisAgent = agents.NewTechAnalysisAgent(aiClient, cc.webAgent)
+	cc.researchAgent = agents.NewResearchAgent(aiClient, cc.webAgent)
 
 	cc.agentManager.Register(cc.emotionAgent)
 	cc.agentManager.Register(cc.plannerAgent)
@@ -79,6 +87,15 @@ func NewCompanionCore(
 	cc.agentManager.Register(cc.webAgent)
 	cc.agentManager.Register(cc.summarizeAgent)
 	cc.agentManager.Register(cc.fileGenerationAgent)
+	cc.agentManager.Register(cc.techAnalysisAgent)
+
+	cc.agentManager.RegisterMutexGroup("search", []string{"web", "tech_analysis", "research"})
+
+	cc.agentManager.RegisterRoute(agents.AgentRoute{
+		AgentName: "tech_analysis",
+		Priority:  92,
+		Keywords:  []string{"什么是", "解释", "分析", "原理", "机制", "架构", "技术", "算法", "模型", "框架", "系统", "工作原理", "Loop", "Agentic", "RAG", "大模型", "LLM", "Transformer", "多模态", "扩散模型", "强化学习", "微调", "推理"},
+	})
 
 	cc.agentManager.RegisterRoute(agents.AgentRoute{
 		AgentName: "planner",
@@ -88,7 +105,7 @@ func NewCompanionCore(
 	cc.agentManager.RegisterRoute(agents.AgentRoute{
 		AgentName: "research",
 		Priority:  90,
-		Keywords:  []string{"搜索", "查一下", "调研", "研究", "什么是", "怎么", "为什么", "如何", "最新", "新闻"},
+		Keywords:  []string{"深度调研", "专题研究", "文献综述", "全面了解", "深入分析", "系统性研究"},
 	})
 	cc.agentManager.RegisterRoute(agents.AgentRoute{
 		AgentName: "reflection",
@@ -113,7 +130,7 @@ func NewCompanionCore(
 	cc.agentManager.RegisterRoute(agents.AgentRoute{
 		AgentName: "web",
 		Priority:  95,
-		Keywords:  []string{"搜索", "查一下", "了解一下", "调研", "研究", "新闻", "最新", "网页", "网站", "链接", "下载", "天气", "汇率", "bing", "必应"},
+		Keywords:  []string{"搜索", "查一下", "了解一下", "新闻", "最新", "网页", "网站", "链接", "下载", "天气", "汇率", "bing", "必应"},
 	})
 	cc.agentManager.RegisterRoute(agents.AgentRoute{
 		AgentName: "summarize",
@@ -229,6 +246,56 @@ func (cc *CompanionCore) ProcessMessageStreamInConversation(
 	effectiveContent := content
 
 	if cmd != "" {
+		if cc.automationService != nil {
+			task, err := cc.automationService.GetTaskBySlashCommand("/" + cmd)
+			if err == nil && task != nil && task.ID > 0 {
+				_, _ = cc.conversationService.SaveMessageToConversation(conversationID, "user", content, "")
+				cc.conversationService.UpdateConversationTitleByFirstMessage(conversationID, content)
+
+				reply := "正在执行任务：" + task.Name + "，请稍候..."
+				if onChunk != nil {
+					onChunk(ai.StreamChunk{Content: reply, Done: false})
+				}
+
+				if taskExecutor, ok := cc.getTaskExecutor(); ok {
+					go func() {
+						exec := taskExecutor.ExecuteTask(task.ID)
+						resultMsg := ""
+						if exec.Status == "success" {
+							resultMsg = "\n\n✅ 任务执行完成！"
+							if exec.ResultContent != "" {
+								if len(exec.ResultContent) > 2000 {
+									resultMsg += "\n\n" + exec.ResultContent[:2000] + "\n...（内容已截断）"
+								} else {
+									resultMsg += "\n\n" + exec.ResultContent
+								}
+							}
+							if exec.ResultPath != "" {
+								resultMsg += "\n\n📁 输出文件: " + exec.ResultPath
+							}
+						} else if exec.Status == "failed" {
+							resultMsg = "\n\n❌ 任务执行失败: " + exec.ErrorMessage
+						} else {
+							resultMsg = "\n\n⏳ 任务已提交，正在执行中..."
+						}
+						if onChunk != nil {
+							onChunk(ai.StreamChunk{Content: resultMsg, Done: true})
+						}
+						fullReply := reply + resultMsg
+						cc.conversationService.SaveMessageToConversation(conversationID, "assistant", fullReply, "专业")
+					}()
+				} else {
+					if onChunk != nil {
+						onChunk(ai.StreamChunk{Content: "\n\n任务已提交执行。", Done: true})
+					}
+					fullReply := reply + "\n\n任务已提交执行。"
+					cc.conversationService.SaveMessageToConversation(conversationID, "assistant", fullReply, "专业")
+				}
+
+				return reply, "专业", nil
+			}
+		}
+
 		switch cmd {
 		case "plan":
 			if arg != "" {
@@ -346,7 +413,7 @@ func (cc *CompanionCore) ProcessMessageStream(
 }
 
 func (cc *CompanionCore) detectEmotionSimple(content string) string {
-	lower := content
+	lower := strings.ToLower(content)
 	happyWords := []string{"开心", "高兴", "快乐", "哈哈", "棒", "喜欢", "爱", "成功"}
 	sadWords := []string{"难过", "伤心", "哭", "失落", "沮丧", "不开心"}
 	angryWords := []string{"生气", "愤怒", "气死", "讨厌", "烦"}
@@ -415,6 +482,30 @@ func (cc *CompanionCore) GetToolAgent() *agents.ToolAgent {
 
 func (cc *CompanionCore) GetWebAgent() *agents.WebAgent {
 	return cc.webAgent
+}
+
+func (cc *CompanionCore) SetAutomationService(s *services.AutomationService) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.automationService = s
+}
+
+func (cc *CompanionCore) GetAutomationService() *services.AutomationService {
+	cc.mu.RLock()
+	defer cc.mu.RUnlock()
+	return cc.automationService
+}
+
+func (cc *CompanionCore) SetTaskExecutor(e TaskExecutor) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.taskExecutor = e
+}
+
+func (cc *CompanionCore) getTaskExecutor() (TaskExecutor, bool) {
+	cc.mu.RLock()
+	defer cc.mu.RUnlock()
+	return cc.taskExecutor, cc.taskExecutor != nil
 }
 
 func (cc *CompanionCore) GetSummarizeAgent() *agents.SummarizeAgent {

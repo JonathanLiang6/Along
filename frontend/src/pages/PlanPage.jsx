@@ -717,6 +717,7 @@ function PlanPage() {
   const [selectedGoal, setSelectedGoal] = useState(null)
   const [showCreate, setShowCreate] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [checkinTasks, setCheckinTasks] = useState([])
 
   const loadGoals = useCallback(async () => {
     if (!hasBackend()) {
@@ -738,9 +739,24 @@ function PlanPage() {
     }
   }, [filterType])
 
+  const loadCheckinTasks = useCallback(async () => {
+    if (!hasBackend()) {
+      setCheckinTasks([])
+      return
+    }
+    try {
+      const tasks = await window.go.main.App.GetAutomationTasks('habit_checkin')
+      setCheckinTasks(Array.isArray(tasks) ? tasks : [])
+    } catch (e) {
+      console.error('加载打卡任务失败:', e)
+      setCheckinTasks([])
+    }
+  }, [])
+
   useEffect(() => {
     loadGoals()
-  }, [loadGoals])
+    loadCheckinTasks()
+  }, [loadGoals, loadCheckinTasks])
 
   const handleCreate = async (title, description, type) => {
     if (!hasBackend()) return
@@ -843,6 +859,53 @@ function PlanPage() {
                   onClick={() => setSelectedGoal(g)}
                 />
               ))}
+            </div>
+          )}
+
+          {checkinTasks.length > 0 && (
+            <div className="mt-6">
+              <div className="flex items-center gap-2 mb-3">
+                <CheckSquare className="w-4 h-4 text-red-400" />
+                <h3 className="font-medium text-text">习惯打卡任务</h3>
+              </div>
+              <div className="grid gap-2">
+                {checkinTasks.map((task) => (
+                  <div
+                    key={task.id}
+                    className="bg-surface/60 border border-border/80 rounded-xl p-4 hover:border-primary-500/40 transition-all cursor-pointer"
+                    onClick={() => window.go.main.App.RunAutomationTaskNow(task.id)}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                          task.enabled ? 'bg-red-500/10' : 'bg-gray-500/10'
+                        }`}>
+                          <CheckSquare className={`w-4 h-4 ${
+                            task.enabled ? 'text-red-400' : 'text-gray-400'
+                          }`} />
+                        </div>
+                        <div>
+                          <h4 className={`font-medium text-sm ${task.enabled ? 'text-text' : 'text-text-muted'}`}>
+                            {task.name}
+                          </h4>
+                          <p className="text-xs text-text-subtle">
+                            {task.slash_command ? `/${task.slash_command}` : ''} · {task.description || '习惯打卡'}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          window.go.main.App.RunAutomationTaskNow(task.id)
+                        }}
+                        className="px-3 py-1.5 bg-primary-600/10 hover:bg-primary-600/20 text-primary-400 text-xs font-medium rounded-lg transition-colors"
+                      >
+                        立即打卡
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </>

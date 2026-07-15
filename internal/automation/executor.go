@@ -5,7 +5,6 @@ import (
 
 	"ai-companion/internal/agents"
 	"ai-companion/internal/models"
-	"ai-companion/internal/services"
 )
 
 // TaskContext 任务执行上下文
@@ -87,6 +86,3 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
-
-// 确保services包被使用
-var _ = services.NewAutomationService

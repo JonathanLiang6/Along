@@ -74,12 +74,12 @@ type ChatResponse struct {
 // Client AI API 客户端
 // 支持多个 provider，遵循 OpenAI 兼容的 Chat Completions 接口
 type Client struct {
-	apiKey     string
-	provider   string
+	apiKey      string
+	provider    string
 	providerCfg Provider
-	baseURL    string
-	model      string
-	httpClient *http.Client
+	baseURL     string
+	model       string
+	httpClient  *http.Client
 }
 
 // NewClient 创建 AI 客户端

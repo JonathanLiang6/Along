@@ -2,41 +2,35 @@ package agents
 
 import (
 	"ai-companion/internal/ai"
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
 
-// ResearchAgent 搜索与调研 Agent
+// ResearchAgent 深度调研 Agent
+// 职责：多轮搜索 + 交叉验证 + 结构化输出的深度调研
 type ResearchAgent struct {
 	BaseAgent
-	httpClient *http.Client
+	webAgent *WebAgent
 }
 
 // NewResearchAgent 创建调研 Agent
-func NewResearchAgent(aiClient *ai.Client) *ResearchAgent {
+func NewResearchAgent(aiClient *ai.Client, webAgent *WebAgent) *ResearchAgent {
 	return &ResearchAgent{
 		BaseAgent: BaseAgent{
 			aiClient: aiClient,
 			name:     "research",
-			desc:     "搜索调研：网络搜索、信息查询、知识问答",
+			desc:     "深度调研：多轮搜索、交叉验证、结构化输出",
 		},
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		webAgent: webAgent,
 	}
 }
 
 // Match 计算匹配度
 func (ra *ResearchAgent) Match(ctx AgentContext) float64 {
 	keywords := []string{
-		"搜索", "查一下", "了解一下", "调研", "研究", "什么是", "怎么",
-		"为什么", "如何", "最新", "新闻", "信息", "资料", "百度", "谷歌",
+		"深度调研", "专题研究", "文献综述", "全面了解", "深入分析",
+		"系统性研究", "综合调研", "调查报告",
 	}
 	return KeywordMatch(ctx.Content, keywords)
 }
@@ -50,7 +44,7 @@ func (ra *ResearchAgent) Process(ctx AgentContext) (*AgentResult, error) {
 		}, nil
 	}
 
-	searchResults, searchErr := ra.webSearch(ctx.Content)
+	searchResults, searchErr := ra.deepResearch(ctx.Content)
 	var contextInfo string
 
 	if searchErr == nil && len(searchResults) > 0 {
@@ -96,7 +90,7 @@ func (ra *ResearchAgent) ProcessStream(ctx AgentContext, callback StreamCallback
 		return nil
 	}
 
-	searchResults, searchErr := ra.webSearch(ctx.Content)
+	searchResults, searchErr := ra.deepResearch(ctx.Content)
 	var contextInfo string
 
 	if searchErr == nil && len(searchResults) > 0 {
@@ -137,61 +131,43 @@ func (ra *ResearchAgent) Handle(content string, context []ai.Message) (string, e
 	return result.Content, nil
 }
 
-// webSearch 执行网络搜索（使用 DuckDuckGo Instant Answer API）
-func (ra *ResearchAgent) webSearch(query string) ([]SearchResult, error) {
-	apiURL := fmt.Sprintf("https://api.duckduckgo.com/?q=%s&format=json&no_html=1&skip_disambig=1", url.QueryEscape(query))
+// deepResearch 深度调研：多角度搜索并去重
+func (ra *ResearchAgent) deepResearch(query string) ([]SearchResult, error) {
+	var allResults []SearchResult
 
-	req, err := http.NewRequestWithContext(context.Background(), "GET", apiURL, nil)
-	if err != nil {
-		return nil, err
+	queries := []string{
+		query,
+		query + " research paper",
+		query + " technical analysis",
+		query + " latest developments",
+		query + " 2026",
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-	resp, err := ra.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("搜索请求失败: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var ddgResp DuckDuckGoResponse
-	if err := json.Unmarshal(body, &ddgResp); err != nil {
-		return nil, err
-	}
-
-	var results []SearchResult
-
-	if ddgResp.AbstractText != "" {
-		results = append(results, SearchResult{
-			Title:   ddgResp.Heading,
-			Link:    ddgResp.AbstractURL,
-			Snippet: ddgResp.AbstractText,
-		})
-	}
-
-	for _, topic := range ddgResp.RelatedTopics {
-		if topic.Text != "" {
-			results = append(results, SearchResult{
-				Title:   extractTitle(topic.Text),
-				Link:    topic.FirstURL,
-				Snippet: topic.Text,
-			})
+	for i, q := range queries {
+		if ra.webAgent != nil {
+			results, err := ra.webAgent.search(q)
+			if err == nil && len(results) > 0 {
+				allResults = append(allResults, results...)
+			}
 		}
-		if len(results) >= 5 {
-			break
+		if i < len(queries)-1 {
+			time.Sleep(300 * time.Millisecond)
 		}
 	}
 
-	return results, nil
+	seen := make(map[string]bool)
+	unique := []SearchResult{}
+	for _, r := range allResults {
+		if !seen[r.Link] && r.Snippet != "" {
+			seen[r.Link] = true
+			unique = append(unique, r)
+			if len(unique) >= 15 {
+				break
+			}
+		}
+	}
+
+	return unique, nil
 }
 
 // summarizeSearchResults 将搜索结果摘要为上下文信息
@@ -215,37 +191,9 @@ func (ra *ResearchAgent) summarizeSearchResults(results []SearchResult) string {
 	return sb.String()
 }
 
-// extractTitle 从文本中提取标题
-func extractTitle(text string) string {
-	parts := strings.SplitN(text, " - ", 2)
-	if len(parts) > 0 {
-		title := strings.TrimSpace(parts[0])
-		if len(title) > 50 {
-			return title[:50] + "..."
-		}
-		return title
-	}
-	if len(text) > 50 {
-		return text[:50] + "..."
-	}
-	return text
-}
-
-// SearchResult 搜索结果
+// SearchResult 搜索结果（复用web_agent的类型）
 type SearchResult struct {
 	Title   string `json:"title"`
 	Link    string `json:"link"`
 	Snippet string `json:"snippet"`
-}
-
-// DuckDuckGoResponse DuckDuckGo API 响应
-type DuckDuckGoResponse struct {
-	AbstractText   string `json:"AbstractText"`
-	AbstractURL    string `json:"AbstractURL"`
-	AbstractSource string `json:"AbstractSource"`
-	Heading        string `json:"Heading"`
-	RelatedTopics  []struct {
-		Text     string `json:"Text"`
-		FirstURL string `json:"FirstURL"`
-	} `json:"RelatedTopics"`
 }

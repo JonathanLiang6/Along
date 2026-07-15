@@ -16,16 +16,15 @@ type SummarizeAgent struct {
 }
 
 // NewSummarizeAgent 创建信息整合 Agent
-func NewSummarizeAgent(aiClient *ai.Client) *SummarizeAgent {
-	agent := &SummarizeAgent{
+func NewSummarizeAgent(aiClient *ai.Client, webAgent *WebAgent) *SummarizeAgent {
+	return &SummarizeAgent{
 		BaseAgent: BaseAgent{
 			aiClient: aiClient,
 			name:     "summarize",
 			desc:     "信息整合：对搜索结果、对话内容、原始文本进行去重、分类、提炼，输出结构化摘要",
 		},
+		webAgent: webAgent,
 	}
-	agent.webAgent = NewWebAgent(aiClient)
-	return agent
 }
 
 // Match 计算匹配度
@@ -93,7 +92,7 @@ func (sa *SummarizeAgent) Process(ctx AgentContext) (*AgentResult, error) {
 		Emotion:      "认真",
 		ShouldRecord: true,
 		Data: map[string]interface{}{
-			"summary_type":  summaryType,
+			"summary_type":   summaryType,
 			"search_results": searchResults,
 			"source_length":  len(sourceText),
 		},

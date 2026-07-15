@@ -9,7 +9,8 @@ import (
 
 // InitDB 初始化数据库并创建表
 func InitDB(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", dbPath)
+	// 添加 busy_timeout 和 WAL 模式，防止数据库锁问题
+	db, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
@@ -32,6 +33,13 @@ func InitDB(dbPath string) (*sql.DB, error) {
 	}
 	if err := addColumnIfMissing(db, "reflections", "observations", "TEXT"); err != nil {
 		fmt.Println("添加 observations 字段失败:", err)
+	}
+	if err := addColumnIfMissing(db, "automation_tasks", "slash_command", "TEXT DEFAULT ''"); err != nil {
+		fmt.Println("添加 slash_command 字段失败:", err)
+	}
+	// 创建索引（CREATE INDEX IF NOT EXISTS 是安全的）
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_slash_cmd ON automation_tasks(slash_command) WHERE slash_command != ''`); err != nil {
+		fmt.Println("创建 slash_command 索引失败:", err)
 	}
 
 	// 迁移旧表数据到新的自动化任务系统
@@ -165,6 +173,7 @@ func createTables(db *sql.DB) error {
 			next_run_at DATETIME,
 			max_retries INTEGER DEFAULT 2,
 			retry_interval_sec INTEGER DEFAULT 30,
+			slash_command TEXT DEFAULT '',
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);`,
@@ -219,6 +228,22 @@ func createTables(db *sql.DB) error {
 			error_message TEXT,
 			FOREIGN KEY (execution_id) REFERENCES automation_executions(id) ON DELETE CASCADE
 		);`,
+		// 14. task_templates 表（任务模板）
+		`CREATE TABLE IF NOT EXISTS task_templates (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			icon TEXT DEFAULT '',
+			description TEXT,
+			task_type TEXT NOT NULL DEFAULT 'workflow',
+			default_config TEXT NOT NULL DEFAULT '{}',
+			default_schedule_type TEXT DEFAULT 'weekly',
+			default_schedule_config TEXT NOT NULL DEFAULT '{}',
+			steps TEXT NOT NULL DEFAULT '[]',
+			is_system BOOLEAN DEFAULT 1,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_templates_system ON task_templates(is_system);`,
 		// 索引
 		`CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);`,
@@ -311,112 +336,167 @@ func migrateLegacyTables(db *sql.DB) error {
 	scheduleIDMap := make(map[int]int)
 	toolflowIDMap := make(map[int]int)
 
+	type toolflowRow struct {
+		id          int
+		name        string
+		description string
+		steps       string
+		enabled     bool
+		createdAt   sql.NullString
+		updatedAt   sql.NullString
+	}
+	var toolflowRows []toolflowRow
 	if toolflowsTable != "" {
 		rows, err := db.Query(fmt.Sprintf("SELECT id, name, description, steps, enabled, created_at, updated_at FROM %s", toolflowsTable))
 		if err == nil {
 			for rows.Next() {
-				var id int
-				var name, description, steps string
-				var enabled bool
-				var createdAt, updatedAt sql.NullString
-				if rows.Scan(&id, &name, &description, &steps, &enabled, &createdAt, &updatedAt) != nil {
+				var r toolflowRow
+				if rows.Scan(&r.id, &r.name, &r.description, &r.steps, &r.enabled, &r.createdAt, &r.updatedAt) != nil {
 					continue
 				}
-				result, err := db.Exec(`INSERT INTO automation_tasks (name, description, task_type, config, schedule_type, schedule_config, enabled, status, created_at, updated_at) VALUES (?, ?, 'workflow', '{}', 'custom', '{}', ?, 'idle', ?, ?)`, name, description, enabled, createdAt.String, updatedAt.String)
-				if err != nil {
-					continue
-				}
-				newID, _ := result.LastInsertId()
-				toolflowIDMap[id] = int(newID)
-				migrateToolFlowSteps(db, int(newID), steps)
+				toolflowRows = append(toolflowRows, r)
 			}
 			rows.Close()
 		}
+		for _, r := range toolflowRows {
+			result, err := db.Exec(`INSERT INTO automation_tasks (name, description, task_type, config, schedule_type, schedule_config, enabled, status, created_at, updated_at) VALUES (?, ?, 'workflow', '{}', 'custom', '{}', ?, 'idle', ?, ?)`, r.name, r.description, r.enabled, r.createdAt.String, r.updatedAt.String)
+			if err != nil {
+				continue
+			}
+			newID, _ := result.LastInsertId()
+			toolflowIDMap[r.id] = int(newID)
+			migrateToolFlowSteps(db, int(newID), r.steps)
+		}
 	}
 
+	type scheduleRow struct {
+		id            int
+		name          string
+		cronExpr      string
+		description   string
+		actionType    string
+		actionPayload string
+		enabled       bool
+		lastRunAt     sql.NullString
+		nextRunAt     sql.NullString
+		status        sql.NullString
+		createdAt     sql.NullString
+		updatedAt     sql.NullString
+	}
+	var scheduleRows []scheduleRow
 	if schedulesTable != "" {
 		rows, err := db.Query(fmt.Sprintf("SELECT id, name, cron_expression, description, action_type, action_payload, enabled, last_run_at, next_run_at, status, created_at, updated_at FROM %s", schedulesTable))
 		if err == nil {
 			for rows.Next() {
-				var id int
-				var name, cronExpr, description, actionType, actionPayload string
-				var enabled bool
-				var lastRunAt, nextRunAt, status, createdAt, updatedAt sql.NullString
-
-				if rows.Scan(&id, &name, &cronExpr, &description, &actionType, &actionPayload, &enabled, &lastRunAt, &nextRunAt, &status, &createdAt, &updatedAt) != nil {
+				var r scheduleRow
+				if rows.Scan(&r.id, &r.name, &r.cronExpr, &r.description, &r.actionType, &r.actionPayload, &r.enabled, &r.lastRunAt, &r.nextRunAt, &r.status, &r.createdAt, &r.updatedAt) != nil {
 					continue
 				}
-
-				taskType := "agent_chat"
-				config := "{}"
-				switch actionType {
-				case "agent_call":
-					taskType = "agent_chat"
-					config = actionPayload
-				case "message":
-					taskType = "reminder"
-					config = actionPayload
-				case "tool_flow":
-					taskType = "workflow"
-					config = actionPayload
-				}
-
-				scheduleConfig := fmt.Sprintf(`{"type":"custom","cron":"%s"}`, cronExpr)
-
-				statusVal := "idle"
-				if status.Valid {
-					switch status.String {
-					case "success", "failed", "running":
-						statusVal = status.String
-					}
-				}
-
-				result, err := db.Exec(`INSERT INTO automation_tasks (name, description, task_type, config, schedule_type, schedule_config, enabled, status, last_run_at, next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, 'custom', ?, ?, ?, ?, ?, ?, ?)`, name, description, taskType, config, scheduleConfig, enabled, statusVal, lastRunAt.String, nextRunAt.String, createdAt.String, updatedAt.String)
-				if err != nil {
-					continue
-				}
-				newID, _ := result.LastInsertId()
-				scheduleIDMap[id] = int(newID)
+				scheduleRows = append(scheduleRows, r)
 			}
 			rows.Close()
 		}
+		for _, r := range scheduleRows {
+			taskType := "agent_chat"
+			config := "{}"
+			switch r.actionType {
+			case "agent_call":
+				taskType = "agent_chat"
+				config = r.actionPayload
+			case "message":
+				taskType = "reminder"
+				config = r.actionPayload
+			case "tool_flow":
+				taskType = "workflow"
+				config = r.actionPayload
+			}
+
+			scheduleConfig := fmt.Sprintf(`{"type":"custom","cron":"%s"}`, r.cronExpr)
+
+			statusVal := "idle"
+			if r.status.Valid {
+				switch r.status.String {
+				case "success", "failed", "running":
+					statusVal = r.status.String
+				}
+			}
+
+			result, err := db.Exec(`INSERT INTO automation_tasks (name, description, task_type, config, schedule_type, schedule_config, enabled, status, last_run_at, next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, 'custom', ?, ?, ?, ?, ?, ?, ?)`, r.name, r.description, taskType, config, scheduleConfig, r.enabled, statusVal, r.lastRunAt.String, r.nextRunAt.String, r.createdAt.String, r.updatedAt.String)
+			if err != nil {
+				continue
+			}
+			newID, _ := result.LastInsertId()
+			scheduleIDMap[r.id] = int(newID)
+		}
 	}
 
+	type execRow struct {
+		id           int
+		refID        int
+		status       sql.NullString
+		errorMessage sql.NullString
+		result       sql.NullString
+		executedAt   sql.NullString
+	}
+	var scheduleExecRows []execRow
 	if scheduleExecTable != "" {
 		rows, err := db.Query(fmt.Sprintf("SELECT id, schedule_id, status, error_message, result, executed_at FROM %s", scheduleExecTable))
 		if err == nil {
 			for rows.Next() {
-				var id, scheduleID int
-				var status, errorMessage, result, executedAt sql.NullString
-				if rows.Scan(&id, &scheduleID, &status, &errorMessage, &result, &executedAt) != nil {
+				var r execRow
+				if rows.Scan(&r.id, &r.refID, &r.status, &r.errorMessage, &r.result, &r.executedAt) != nil {
 					continue
 				}
-				newTaskID, ok := scheduleIDMap[scheduleID]
-				if !ok {
-					continue
-				}
-				db.Exec(`INSERT INTO automation_executions (task_id, status, result_type, result_content, error_message, started_at, finished_at) VALUES (?, ?, 'text', ?, ?, ?, ?)`, newTaskID, status.String, result.String, errorMessage.String, executedAt.String, executedAt.String)
+				scheduleExecRows = append(scheduleExecRows, r)
 			}
 			rows.Close()
 		}
+		for _, r := range scheduleExecRows {
+			newTaskID, ok := scheduleIDMap[r.refID]
+			if !ok {
+				continue
+			}
+			db.Exec(`INSERT INTO automation_executions (task_id, status, result_type, result_content, error_message, started_at, finished_at) VALUES (?, ?, 'text', ?, ?, ?, ?)`, newTaskID, r.status.String, r.result.String, r.errorMessage.String, r.executedAt.String, r.executedAt.String)
+		}
 	}
 
+	var toolflowExecRows []struct {
+		id           int
+		refID        int
+		status       sql.NullString
+		inputs       sql.NullString
+		outputs      sql.NullString
+		errorMessage sql.NullString
+		startedAt    sql.NullString
+		finishedAt   sql.NullString
+	}
 	if toolflowExecTable != "" {
 		rows, err := db.Query(fmt.Sprintf("SELECT id, toolflow_id, status, inputs, outputs, error_message, started_at, finished_at FROM %s", toolflowExecTable))
 		if err == nil {
 			for rows.Next() {
-				var id, toolflowID int
-				var status, inputs, outputs, errorMessage, startedAt, finishedAt sql.NullString
-				if rows.Scan(&id, &toolflowID, &status, &inputs, &outputs, &errorMessage, &startedAt, &finishedAt) != nil {
+				var r struct {
+					id           int
+					refID        int
+					status       sql.NullString
+					inputs       sql.NullString
+					outputs      sql.NullString
+					errorMessage sql.NullString
+					startedAt    sql.NullString
+					finishedAt   sql.NullString
+				}
+				if rows.Scan(&r.id, &r.refID, &r.status, &r.inputs, &r.outputs, &r.errorMessage, &r.startedAt, &r.finishedAt) != nil {
 					continue
 				}
-				newTaskID, ok := toolflowIDMap[toolflowID]
-				if !ok {
-					continue
-				}
-				db.Exec(`INSERT INTO automation_executions (task_id, status, result_type, result_content, error_message, started_at, finished_at) VALUES (?, ?, 'text', ?, ?, ?, ?)`, newTaskID, status.String, outputs.String, errorMessage.String, startedAt.String, finishedAt.String)
+				toolflowExecRows = append(toolflowExecRows, r)
 			}
 			rows.Close()
+		}
+		for _, r := range toolflowExecRows {
+			newTaskID, ok := toolflowIDMap[r.refID]
+			if !ok {
+				continue
+			}
+			db.Exec(`INSERT INTO automation_executions (task_id, status, result_type, result_content, error_message, started_at, finished_at) VALUES (?, ?, 'text', ?, ?, ?, ?)`, newTaskID, r.status.String, r.outputs.String, r.errorMessage.String, r.startedAt.String, r.finishedAt.String)
 		}
 	}
 

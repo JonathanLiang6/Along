@@ -15,14 +15,14 @@ type AgentIntent struct {
 
 // AgentContext Agent 执行上下文
 type AgentContext struct {
-	UserID      string
-	Content     string
-	History     []ai.Message
-	Memory      []MemoryItem
-	Intent      AgentIntent
-	SessionID   string
-	RequestID   string
-	Extra       map[string]interface{}
+	UserID    string
+	Content   string
+	History   []ai.Message
+	Memory    []MemoryItem
+	Intent    AgentIntent
+	SessionID string
+	RequestID string
+	Extra     map[string]interface{}
 }
 
 // MemoryItem 简化的记忆项
@@ -76,8 +76,8 @@ type BaseAgent struct {
 	desc     string
 }
 
-func (b *BaseAgent) Name() string { return b.name }
-func (b *BaseAgent) Description() string { return b.desc }
+func (b *BaseAgent) Name() string                     { return b.name }
+func (b *BaseAgent) Description() string              { return b.desc }
 func (b *BaseAgent) UpdateAIClient(client *ai.Client) { b.aiClient = client }
 
 // KeywordMatch 基于关键词的基础匹配度计算

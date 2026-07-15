@@ -542,7 +542,7 @@ function SettingsPage({ onClose }) {
 
         {/* 底部版本信息 */}
         <div className="px-5 py-3 border-t border-border text-center">
-          <span className="text-xs text-text-subtle">AI Companion v1.0.0</span>
+          <span className="text-xs text-text-subtle">Along v1.0.0</span>
         </div>
       </div>
     </div>

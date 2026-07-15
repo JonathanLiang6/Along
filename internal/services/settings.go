@@ -13,16 +13,76 @@ import (
 	"sync"
 )
 
+type SettingChangeHandler func(key, oldValue, newValue string) error
+
 // SettingsService 设置服务
 type SettingsService struct {
-	db           *sql.DB
+	db            *sql.DB
 	encryptionKey []byte
-	keyOnce      sync.Once
+	keyOnce       sync.Once
+	mu            sync.RWMutex
+	hooks         map[string][]SettingChangeHandler
+	defaults      map[string]string
 }
 
 // NewSettingsService 创建设置服务
 func NewSettingsService(db *sql.DB) *SettingsService {
-	return &SettingsService{db: db}
+	s := &SettingsService{
+		db:    db,
+		hooks: make(map[string][]SettingChangeHandler),
+		defaults: map[string]string{
+			"api_provider":         "deepseek",
+			"theme":                "dark",
+			"auto_start":           "false",
+			"system_tray_enabled":  "true",
+			"close_behavior":       "tray",
+			"font_size":            "14px",
+			"onboarding_completed": "false",
+		},
+	}
+	return s
+}
+
+// InitDefaults 初始化默认设置（幂等）
+func (s *SettingsService) InitDefaults() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, defaultValue := range s.defaults {
+		current, err := s.getUnlocked(key)
+		if err != nil {
+			fmt.Printf("读取设置 %s 失败: %v\n", key, err)
+			continue
+		}
+		if current == "" {
+			if err := s.setUnlocked(key, defaultValue); err != nil {
+				fmt.Printf("初始化默认设置 %s 失败: %v\n", key, err)
+			}
+		}
+	}
+	fmt.Println("默认设置初始化完成")
+	return nil
+}
+
+// OnChange 注册设置变更钩子
+func (s *SettingsService) OnChange(key string, handler SettingChangeHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hooks[key] = append(s.hooks[key], handler)
+}
+
+// triggerHooks 触发变更钩子（调用方已持有写锁）
+func (s *SettingsService) triggerHooks(key, oldValue, newValue string) error {
+	hooks := s.hooks[key]
+	if len(hooks) == 0 {
+		return nil
+	}
+	for _, hook := range hooks {
+		if err := hook(key, oldValue, newValue); err != nil {
+			fmt.Printf("设置变更钩子执行失败 [%s]: %v\n", key, err)
+		}
+	}
+	return nil
 }
 
 // getEncryptionKey 获取加密密钥（基于机器名和用户名生成）
@@ -112,6 +172,13 @@ func (s *SettingsService) decrypt(ciphertextHex string) (string, error) {
 
 // GetAll 获取所有设置
 func (s *SettingsService) GetAll() (map[string]string, error) {
+	if s == nil || s.db == nil {
+		return map[string]string{}, fmt.Errorf("设置服务未初始化")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	rows, err := s.db.Query("SELECT key, value FROM settings")
 	if err != nil {
 		return nil, err
@@ -124,25 +191,24 @@ func (s *SettingsService) GetAll() (map[string]string, error) {
 		if err := rows.Scan(&key, &value); err != nil {
 			continue
 		}
-
-		// 对 api_key 自动解密
-		if key == "api_key" {
-			decrypted, err := s.decrypt(value)
-			if err != nil {
-				// 解密失败，使用原值
-				settings[key] = value
-			} else {
-				settings[key] = decrypted
-			}
-		} else {
-			settings[key] = value
-		}
+		settings[key] = s.decryptIfNeeded(key, value)
 	}
 	return settings, nil
 }
 
 // Get 获取单个设置
 func (s *SettingsService) Get(key string) (string, error) {
+	if s == nil || s.db == nil {
+		return "", fmt.Errorf("设置服务未初始化")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getUnlocked(key)
+}
+
+// getUnlocked 不加锁的内部读取
+func (s *SettingsService) getUnlocked(key string) (string, error) {
 	var value string
 	err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&value)
 	if err == sql.ErrNoRows {
@@ -151,35 +217,61 @@ func (s *SettingsService) Get(key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return s.decryptIfNeeded(key, value), nil
+}
 
-	// 对 api_key 自动解密
+// decryptIfNeeded 需要时解密
+func (s *SettingsService) decryptIfNeeded(key, value string) string {
 	if key == "api_key" {
-		decrypted, decryptErr := s.decrypt(value)
-		if decryptErr != nil {
-			// 解密失败，返回原值
-			return value, nil
+		decrypted, err := s.decrypt(value)
+		if err != nil {
+			return value
 		}
-		return decrypted, nil
+		return decrypted
 	}
-
-	return value, nil
+	return value
 }
 
 // Set 保存设置
 func (s *SettingsService) Set(key, value string) error {
-	// 对 api_key 自动加密
+	if s == nil || s.db == nil {
+		return fmt.Errorf("设置服务未初始化")
+	}
+	if key == "" {
+		return fmt.Errorf("设置键不能为空")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	oldValue, _ := s.getUnlocked(key)
+	if oldValue == value {
+		return nil
+	}
+
+	if err := s.setUnlocked(key, value); err != nil {
+		return err
+	}
+
+	s.triggerHooks(key, oldValue, value)
+	return nil
+}
+
+// setUnlocked 不加锁的内部写入
+func (s *SettingsService) setUnlocked(key, value string) error {
+	storedValue := value
 	if key == "api_key" && value != "" {
 		encrypted, err := s.encrypt(value)
 		if err != nil {
 			return fmt.Errorf("加密失败: %w", err)
 		}
-		value = encrypted
+		storedValue = encrypted
 	}
 
 	_, err := s.db.Exec(
 		`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-		key, value,
+		key, storedValue,
 	)
 	if err != nil {
 		return fmt.Errorf("保存设置失败: %w", err)

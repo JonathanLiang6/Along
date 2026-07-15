@@ -14,10 +14,16 @@ import (
 var assets embed.FS
 
 func main() {
-	app := NewApp()
+	app, err := NewApp()
+	if err != nil {
+		log.Fatalf("应用初始化失败: %v", err)
+	}
+	if app == nil {
+		log.Fatal("应用初始化失败: 返回 nil")
+	}
 
-	err := wails.Run(&options.App{
-		Title:     "AI Companion - Along",
+	err = wails.Run(&options.App{
+		Title:     "Along",
 		Width:     1200,
 		Height:    800,
 		MinWidth:  900,

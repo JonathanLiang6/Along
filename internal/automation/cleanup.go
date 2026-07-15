@@ -28,10 +28,10 @@ func (e *CleanupExecutor) Execute(config map[string]interface{}, ctx TaskContext
 
 	// 允许清理的表白名单
 	allowedTables := map[string]string{
-		"automation_executions":        "started_at",
-		"automation_step_executions":   "id",
-		"messages":                     "timestamp",
-		"observations":                 "created_at",
+		"automation_executions":      "started_at",
+		"automation_step_executions": "id",
+		"messages":                   "timestamp",
+		"observations":               "created_at",
 	}
 
 	dateColumn, allowed := allowedTables[tableName]

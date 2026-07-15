@@ -8,9 +8,10 @@ import (
 
 // AgentManager Agent 管理器 - 负责注册、路由、调度
 type AgentManager struct {
-	mu     sync.RWMutex
-	agents map[string]Agent
-	routes []AgentRoute
+	mu          sync.RWMutex
+	agents      map[string]Agent
+	routes      []AgentRoute
+	mutexGroups map[string][]string
 }
 
 // AgentRoute Agent 路由规则
@@ -23,9 +24,17 @@ type AgentRoute struct {
 // NewAgentManager 创建 Agent 管理器
 func NewAgentManager() *AgentManager {
 	return &AgentManager{
-		agents: make(map[string]Agent),
-		routes: make([]AgentRoute, 0),
+		agents:      make(map[string]Agent),
+		routes:      make([]AgentRoute, 0),
+		mutexGroups: make(map[string][]string),
 	}
+}
+
+// RegisterMutexGroup 注册互斥组：同一组内的Agent只能选一个
+func (am *AgentManager) RegisterMutexGroup(groupName string, agentNames []string) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	am.mutexGroups[groupName] = agentNames
 }
 
 // Register 注册一个 Agent
@@ -78,7 +87,6 @@ func (am *AgentManager) Route(ctx AgentContext) RouteResult {
 
 	var results []RouteResult
 
-	// 首先使用路由规则快速匹配
 	for _, route := range am.routes {
 		agent, ok := am.agents[route.AgentName]
 		if !ok {
@@ -94,9 +102,7 @@ func (am *AgentManager) Route(ctx AgentContext) RouteResult {
 		}
 	}
 
-	// 然后让每个 Agent 自己计算匹配度
 	for name, agent := range am.agents {
-		// 跳过已经在路由结果中的
 		found := false
 		for _, r := range results {
 			if r.AgentName == name {
@@ -118,17 +124,17 @@ func (am *AgentManager) Route(ctx AgentContext) RouteResult {
 		}
 	}
 
-	// 按置信度排序
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Confidence > results[j].Confidence
 	})
 
-	// 返回置信度最高的，默认返回 emotion
-	if len(results) > 0 && results[0].Confidence > 0.15 {
-		return results[0]
+	// 应用互斥组规则：同一组内只保留最高置信度的
+	filtered := am.applyMutexGroups(results)
+
+	if len(filtered) > 0 && filtered[0].Confidence > 0.15 {
+		return filtered[0]
 	}
 
-	// 默认使用情感陪伴 Agent
 	if agent, ok := am.agents["emotion"]; ok {
 		return RouteResult{
 			AgentName:  "emotion",
@@ -137,7 +143,6 @@ func (am *AgentManager) Route(ctx AgentContext) RouteResult {
 		}
 	}
 
-	// 兜底：返回第一个可用的
 	for name, agent := range am.agents {
 		return RouteResult{
 			AgentName:  name,
@@ -147,6 +152,43 @@ func (am *AgentManager) Route(ctx AgentContext) RouteResult {
 	}
 
 	return RouteResult{}
+}
+
+// applyMutexGroups 应用互斥组规则
+func (am *AgentManager) applyMutexGroups(results []RouteResult) []RouteResult {
+	if len(am.mutexGroups) == 0 {
+		return results
+	}
+
+	agentGroup := make(map[string]string)
+	for groupName, agents := range am.mutexGroups {
+		for _, agent := range agents {
+			agentGroup[agent] = groupName
+		}
+	}
+
+	groupBest := make(map[string]RouteResult)
+	nonMutexResults := []RouteResult{}
+
+	for _, r := range results {
+		if groupName, ok := agentGroup[r.AgentName]; ok {
+			if existing, exists := groupBest[groupName]; !exists || r.Confidence > existing.Confidence {
+				groupBest[groupName] = r
+			}
+		} else {
+			nonMutexResults = append(nonMutexResults, r)
+		}
+	}
+
+	for _, r := range groupBest {
+		nonMutexResults = append(nonMutexResults, r)
+	}
+
+	sort.Slice(nonMutexResults, func(i, j int) bool {
+		return nonMutexResults[i].Confidence > nonMutexResults[j].Confidence
+	})
+
+	return nonMutexResults
 }
 
 // Process 处理消息（同步）

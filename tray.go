@@ -45,12 +45,12 @@ func (t *trayQuitCh) Reset() {
 }
 
 type trayState struct {
-	ctx          interface{}
-	unreadCount  int
-	mu           sync.Mutex
-	running      bool
-	stopCh       chan struct{}
-	wg           sync.WaitGroup
+	ctx         interface{}
+	unreadCount int
+	mu          sync.Mutex
+	running     bool
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
 }
 
 var tray = &trayState{
@@ -107,7 +107,7 @@ func IsTrayRunning() bool {
 func onReady(app *App) {
 	systray.SetIcon(trayIcon)
 	systray.SetTitle("Along")
-	systray.SetTooltip("AI Companion - Along")
+	systray.SetTooltip("Along")
 
 	mShow := systray.AddMenuItem("显示主窗口", "显示主窗口")
 	mQuickSearch := systray.AddMenuItem("快速搜索", "快速打开搜索功能")
@@ -117,7 +117,7 @@ func onReady(app *App) {
 	mAutomation := systray.AddMenuItem("自动化", "管理自动化任务")
 	systray.AddSeparator()
 
-	mStatus := systray.AddMenuItem("正在运行", "AI Companion 状态")
+	mStatus := systray.AddMenuItem("正在运行", "Along 状态")
 	systray.AddSeparator()
 
 	mSettings := systray.AddMenuItem("设置", "打开设置")

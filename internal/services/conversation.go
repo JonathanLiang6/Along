@@ -254,8 +254,8 @@ func (s *ConversationService) appendToJSONFile(key string, convID int, role, con
 }
 
 type conversationDoc struct {
-	ConversationID int             `json:"conversation_id"`
-	Date           string          `json:"date,omitempty"`
+	ConversationID int               `json:"conversation_id"`
+	Date           string            `json:"date,omitempty"`
 	Messages       []conversationMsg `json:"messages"`
 }
 

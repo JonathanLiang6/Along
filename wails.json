@@ -1,7 +1,7 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
-  "name": "ai-companion",
-  "outputfilename": "AICompanion",
+  "name": "Along",
+  "outputfilename": "Along",
   "frontend": {
     "dir": "./frontend",
     "install": "npm install",
@@ -10,14 +10,14 @@
     "package": "npm run build"
   },
   "author": {
-    "name": "AI Companion Team",
-    "email": "dev@aicompanion.local"
+    "name": "Along Team",
+    "email": "dev@along.local"
   },
   "info": {
-    "companyName": "AI Companion",
-    "productName": "AI Companion Desktop",
+    "companyName": "Along",
+    "productName": "Along",
     "productVersion": "1.0.0",
     "copyright": "Copyright © 2026",
-    "comments": "AI Companion - Along"
+    "comments": "Along - AI Companion"
   }
 }

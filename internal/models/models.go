@@ -40,20 +40,20 @@ type Memory struct {
 
 // Goal 计划模型（学习/项目/习惯/生活）
 type Goal struct {
-	ID              int    `json:"id"`
-	Title           string `json:"title"`
-	Description     string `json:"description"`
-	Type            string `json:"type"` // learning / project / habit / life
-	Status          string `json:"status"` // active / completed / paused / dropped
-	StartDate       string `json:"start_date"`
-	TargetDate      string `json:"target_date,omitempty"`
-	CurrentFocus    string `json:"current_focus,omitempty"`
-	NextStep        string `json:"next_step,omitempty"`
-	CompanionNote   string `json:"companion_note,omitempty"`
-	Progress        int    `json:"progress"`
-	Mood            string `json:"mood,omitempty"`
-	CreatedAt       string `json:"created_at"`
-	UpdatedAt       string `json:"updated_at"`
+	ID            int    `json:"id"`
+	Title         string `json:"title"`
+	Description   string `json:"description"`
+	Type          string `json:"type"`   // learning / project / habit / life
+	Status        string `json:"status"` // active / completed / paused / dropped
+	StartDate     string `json:"start_date"`
+	TargetDate    string `json:"target_date,omitempty"`
+	CurrentFocus  string `json:"current_focus,omitempty"`
+	NextStep      string `json:"next_step,omitempty"`
+	CompanionNote string `json:"companion_note,omitempty"`
+	Progress      int    `json:"progress"`
+	Mood          string `json:"mood,omitempty"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 // Milestone 里程碑
@@ -154,21 +154,38 @@ type AutomationTask struct {
 	NextRunAt        string `json:"next_run_at"`
 	MaxRetries       int    `json:"max_retries"`
 	RetryIntervalSec int    `json:"retry_interval_sec"`
+	SlashCommand     string `json:"slash_command"`
 	CreatedAt        string `json:"created_at"`
 	UpdatedAt        string `json:"updated_at"`
 }
 
 // AutomationStep 流程编排步骤
 type AutomationStep struct {
-	ID             int    `json:"id"`
-	TaskID         int    `json:"task_id"`
-	StepIndex      int    `json:"step_index"`
-	StepType       string `json:"step_type"`
-	Name           string `json:"name"`
-	Config         string `json:"config"`
-	OutputVar      string `json:"output_var"`
-	NextOnSuccess  int    `json:"next_on_success"`
-	NextOnFailure  int    `json:"next_on_failure"`
+	ID            int    `json:"id"`
+	TaskID        int    `json:"task_id"`
+	StepIndex     int    `json:"step_index"`
+	StepType      string `json:"step_type"`
+	Name          string `json:"name"`
+	Config        string `json:"config"`
+	OutputVar     string `json:"output_var"`
+	NextOnSuccess int    `json:"next_on_success"`
+	NextOnFailure int    `json:"next_on_failure"`
+}
+
+// TaskTemplate 任务模板
+type TaskTemplate struct {
+	ID                    int    `json:"id"`
+	Name                  string `json:"name"`
+	Icon                  string `json:"icon"`
+	Description           string `json:"description"`
+	TaskType              string `json:"task_type"`
+	DefaultConfig         string `json:"default_config"`
+	DefaultScheduleType   string `json:"default_schedule_type"`
+	DefaultScheduleConfig string `json:"default_schedule_config"`
+	Steps                 string `json:"steps"`
+	IsSystem              bool   `json:"is_system"`
+	CreatedAt             string `json:"created_at"`
+	UpdatedAt             string `json:"updated_at"`
 }
 
 // AutomationDependency 任务依赖关系

@@ -11,11 +11,11 @@ import (
 
 // 文档模板类型
 const (
-	TemplateResearch   = "research"   // 研究报告
-	TemplateWeekly     = "weekly"     // 周报
-	TemplateMeeting    = "meeting"    // 会议纪要
+	TemplateResearch   = "research"    // 研究报告
+	TemplateWeekly     = "weekly"      // 周报
+	TemplateMeeting    = "meeting"     // 会议纪要
 	TemplateTechReview = "tech_review" // 技术评测
-	TemplateGeneral    = "general"    // 通用
+	TemplateGeneral    = "general"     // 通用
 )
 
 // FileGenerationAgent 文件生成 Agent

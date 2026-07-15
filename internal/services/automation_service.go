@@ -27,12 +27,12 @@ func (s *AutomationService) GetTasks(taskType string) ([]models.AutomationTask, 
 	if taskType == "" {
 		query = `SELECT id, name, COALESCE(description, ''), task_type, config, schedule_type, schedule_config,
 					enabled, COALESCE(status, ''), COALESCE(last_run_at, ''), COALESCE(next_run_at, ''),
-					max_retries, retry_interval_sec, COALESCE(created_at, ''), COALESCE(updated_at, '')
+					max_retries, retry_interval_sec, COALESCE(slash_command, ''), COALESCE(created_at, ''), COALESCE(updated_at, '')
 				 FROM automation_tasks ORDER BY id DESC`
 	} else {
 		query = `SELECT id, name, COALESCE(description, ''), task_type, config, schedule_type, schedule_config,
 					enabled, COALESCE(status, ''), COALESCE(last_run_at, ''), COALESCE(next_run_at, ''),
-					max_retries, retry_interval_sec, COALESCE(created_at, ''), COALESCE(updated_at, '')
+					max_retries, retry_interval_sec, COALESCE(slash_command, ''), COALESCE(created_at, ''), COALESCE(updated_at, '')
 				 FROM automation_tasks WHERE task_type = ? ORDER BY id DESC`
 		args = append(args, taskType)
 	}
@@ -58,7 +58,7 @@ func (s *AutomationService) GetTasks(taskType string) ([]models.AutomationTask, 
 func (s *AutomationService) GetTask(id int) (*models.AutomationTask, error) {
 	query := `SELECT id, name, COALESCE(description, ''), task_type, config, schedule_type, schedule_config,
 				enabled, COALESCE(status, ''), COALESCE(last_run_at, ''), COALESCE(next_run_at, ''),
-				max_retries, retry_interval_sec, COALESCE(created_at, ''), COALESCE(updated_at, '')
+				max_retries, retry_interval_sec, COALESCE(slash_command, ''), COALESCE(created_at, ''), COALESCE(updated_at, '')
 			  FROM automation_tasks WHERE id = ?`
 
 	row := s.db.QueryRow(query, id)
@@ -75,10 +75,10 @@ func (s *AutomationService) GetTask(id int) (*models.AutomationTask, error) {
 // CreateTask 创建任务
 func (s *AutomationService) CreateTask(task *models.AutomationTask) (int, error) {
 	query := `INSERT INTO automation_tasks (name, description, task_type, config, schedule_type, schedule_config,
-				enabled, status, max_retries, retry_interval_sec)
-			  VALUES (?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)`
+				enabled, status, max_retries, retry_interval_sec, slash_command)
+			  VALUES (?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?)`
 	result, err := s.db.Exec(query, task.Name, task.Description, task.TaskType, task.Config,
-		task.ScheduleType, task.ScheduleConfig, task.Enabled, task.MaxRetries, task.RetryIntervalSec)
+		task.ScheduleType, task.ScheduleConfig, task.Enabled, task.MaxRetries, task.RetryIntervalSec, task.SlashCommand)
 	if err != nil {
 		return 0, err
 	}
@@ -93,9 +93,9 @@ func (s *AutomationService) CreateTask(task *models.AutomationTask) (int, error)
 func (s *AutomationService) UpdateTask(task *models.AutomationTask) error {
 	query := `UPDATE automation_tasks SET name = ?, description = ?, task_type = ?, config = ?,
 				schedule_type = ?, schedule_config = ?, enabled = ?, max_retries = ?, retry_interval_sec = ?,
-				updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+				slash_command = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
 	_, err := s.db.Exec(query, task.Name, task.Description, task.TaskType, task.Config,
-		task.ScheduleType, task.ScheduleConfig, task.Enabled, task.MaxRetries, task.RetryIntervalSec, task.ID)
+		task.ScheduleType, task.ScheduleConfig, task.Enabled, task.MaxRetries, task.RetryIntervalSec, task.SlashCommand, task.ID)
 	return err
 }
 
@@ -348,7 +348,7 @@ func scanTaskRow(r rowScanner) (models.AutomationTask, error) {
 	var t models.AutomationTask
 	err := r.Scan(&t.ID, &t.Name, &t.Description, &t.TaskType, &t.Config, &t.ScheduleType,
 		&t.ScheduleConfig, &t.Enabled, &t.Status, &t.LastRunAt, &t.NextRunAt,
-		&t.MaxRetries, &t.RetryIntervalSec, &t.CreatedAt, &t.UpdatedAt)
+		&t.MaxRetries, &t.RetryIntervalSec, &t.SlashCommand, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
 		return t, err
 	}
@@ -384,7 +384,14 @@ func ParseScheduleConfig(scheduleType, config string) (string, error) {
 			timeStr = "09:00"
 		}
 		hour, minute := parseTimeStr(timeStr)
-		dayOfWeek := 1 // 默认周一
+		if daysArr, ok := cfg["days"].([]interface{}); ok && len(daysArr) > 0 {
+			var days []string
+			for _, d := range daysArr {
+				days = append(days, fmt.Sprintf("%d", int(d.(float64))))
+			}
+			return fmt.Sprintf("%d %d * * %s", minute, hour, strings.Join(days, ",")), nil
+		}
+		dayOfWeek := 1
 		if d, ok := cfg["day"].(float64); ok {
 			dayOfWeek = int(d)
 		}
@@ -494,4 +501,117 @@ func parseTimeStr(s string) (int, int) {
 func chineseWeekday(w time.Weekday) string {
 	names := []string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
 	return names[int(w)]
+}
+
+// ==================== 模板相关 ====================
+
+// GetTaskTemplates 获取任务模板列表
+func (s *AutomationService) GetTaskTemplates() ([]models.TaskTemplate, error) {
+	query := `SELECT id, name, COALESCE(icon, ''), COALESCE(description, ''), task_type,
+				default_config, default_schedule_type, default_schedule_config, steps, is_system,
+				COALESCE(created_at, ''), COALESCE(updated_at, '')
+			  FROM task_templates ORDER BY is_system DESC, id ASC`
+
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var templates []models.TaskTemplate
+	for rows.Next() {
+		var t models.TaskTemplate
+		if err := rows.Scan(&t.ID, &t.Name, &t.Icon, &t.Description, &t.TaskType,
+			&t.DefaultConfig, &t.DefaultScheduleType, &t.DefaultScheduleConfig,
+			&t.Steps, &t.IsSystem, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			continue
+		}
+		templates = append(templates, t)
+	}
+	return templates, nil
+}
+
+// GetTaskTemplate 获取单个模板
+func (s *AutomationService) GetTaskTemplate(id int) (*models.TaskTemplate, error) {
+	query := `SELECT id, name, COALESCE(icon, ''), COALESCE(description, ''), task_type,
+				default_config, default_schedule_type, default_schedule_config, steps, is_system,
+				COALESCE(created_at, ''), COALESCE(updated_at, '')
+			  FROM task_templates WHERE id = ?`
+
+	row := s.db.QueryRow(query, id)
+	var t models.TaskTemplate
+	err := row.Scan(&t.ID, &t.Name, &t.Icon, &t.Description, &t.TaskType,
+		&t.DefaultConfig, &t.DefaultScheduleType, &t.DefaultScheduleConfig,
+		&t.Steps, &t.IsSystem, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("模板 %d 不存在", id)
+		}
+		return nil, err
+	}
+	return &t, nil
+}
+
+// CreateTaskFromTemplate 从模板创建任务
+func (s *AutomationService) CreateTaskFromTemplate(templateID int, name, description string, scheduleType, scheduleConfig, slashCommand string) (int, error) {
+	template, err := s.GetTaskTemplate(templateID)
+	if err != nil {
+		return 0, err
+	}
+
+	config := template.DefaultConfig
+	if description == "" {
+		description = template.Description
+	}
+	if scheduleType == "" {
+		scheduleType = template.DefaultScheduleType
+	}
+	if scheduleConfig == "" {
+		scheduleConfig = template.DefaultScheduleConfig
+	}
+
+	task := &models.AutomationTask{
+		Name:             name,
+		Description:      description,
+		TaskType:         template.TaskType,
+		Config:           config,
+		ScheduleType:     scheduleType,
+		ScheduleConfig:   scheduleConfig,
+		Enabled:          true,
+		MaxRetries:       2,
+		RetryIntervalSec: 30,
+		SlashCommand:     slashCommand,
+	}
+
+	taskID, err := s.CreateTask(task)
+	if err != nil {
+		return 0, err
+	}
+
+	if template.Steps != "" && template.Steps != "[]" {
+		err = s.SaveStepsJSON(taskID, template.Steps)
+		if err != nil {
+			return taskID, err
+		}
+	}
+
+	return taskID, nil
+}
+
+// GetTaskBySlashCommand 根据斜杠命令获取任务
+func (s *AutomationService) GetTaskBySlashCommand(command string) (*models.AutomationTask, error) {
+	query := `SELECT id, name, COALESCE(description, ''), task_type, config, schedule_type, schedule_config,
+				enabled, COALESCE(status, ''), COALESCE(last_run_at, ''), COALESCE(next_run_at, ''),
+				max_retries, retry_interval_sec, COALESCE(slash_command, ''), COALESCE(created_at, ''), COALESCE(updated_at, '')
+			  FROM automation_tasks WHERE slash_command = ? AND enabled = 1`
+
+	row := s.db.QueryRow(query, command)
+	task, err := scanTaskRow(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("未找到命令 %s 对应的任务", command)
+		}
+		return nil, err
+	}
+	return &task, nil
 }

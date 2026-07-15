@@ -246,12 +246,12 @@ func (s *PlanService) AddMilestone(goalID int, title, description string) (*mode
 	}
 	lastID, _ := result.LastInsertId()
 	return &models.Milestone{
-		ID:         int(lastID),
-		GoalID:     goalID,
-		Title:      title,
+		ID:          int(lastID),
+		GoalID:      goalID,
+		Title:       title,
 		Description: description,
-		Status:     "pending",
-		OrderIndex: orderIdx,
+		Status:      "pending",
+		OrderIndex:  orderIdx,
 	}, nil
 }
 

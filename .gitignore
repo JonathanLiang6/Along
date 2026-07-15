@@ -25,13 +25,19 @@ Thumbs.db
 *.log
 logs/
 
-# Database
-data/*.db
-data/*.db-journal
+# Database & Data (运行时数据，不纳入版本控制)
+data/
+build/bin/data/
 
 # Environment
 .env
 .env.local
+
+# Legacy data migration
+along-pre/
+
+# Temporary scripts
+*.bat
 
 # Wails
 frontend/wailsjs/

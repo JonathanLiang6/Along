@@ -30,6 +30,19 @@ func NewDuckDuckGoProvider() *DuckDuckGoProvider {
 
 func (p *DuckDuckGoProvider) Name() string { return "duckduckgo" }
 
+func extractTitle(text string) string {
+	if idx := strings.Index(text, " - "); idx != -1 {
+		return text[:idx]
+	}
+	if idx := strings.Index(text, " — "); idx != -1 {
+		return text[:idx]
+	}
+	if len(text) > 60 {
+		return text[:60] + "..."
+	}
+	return text
+}
+
 func (p *DuckDuckGoProvider) Search(query string) ([]SearchResult, error) {
 	apiURL := fmt.Sprintf("https://api.duckduckgo.com/?q=%s&format=json&no_html=1&skip_disambig=1", url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(context.Background(), "GET", apiURL, nil)
@@ -54,17 +67,17 @@ func (p *DuckDuckGoProvider) Search(query string) ([]SearchResult, error) {
 	}
 
 	var ddgResp struct {
-		AbstractText   string `json:"AbstractText"`
-		AbstractURL    string `json:"AbstractURL"`
-		Heading        string `json:"Heading"`
-		RelatedTopics  []struct {
+		AbstractText  string `json:"AbstractText"`
+		AbstractURL   string `json:"AbstractURL"`
+		Heading       string `json:"Heading"`
+		RelatedTopics []struct {
 			Text     string `json:"Text"`
 			FirstURL string `json:"FirstURL"`
 		} `json:"RelatedTopics"`
 		Results []struct {
-			Title   string `json:"Title"`
+			Title    string `json:"Title"`
 			FirstURL string `json:"FirstURL"`
-			Text    string `json:"Text"`
+			Text     string `json:"Text"`
 		} `json:"Results"`
 	}
 
@@ -181,10 +194,10 @@ func (p *BingProvider) Search(query string) ([]SearchResult, error) {
 
 type WebAgent struct {
 	BaseAgent
-	httpClient       *http.Client
-	searchProviders  []SearchProvider
-	currentProvider  string
-	bingAPIKey       string
+	httpClient      *http.Client
+	searchProviders []SearchProvider
+	currentProvider string
+	bingAPIKey      string
 }
 
 func NewWebAgent(aiClient *ai.Client) *WebAgent {
@@ -322,7 +335,18 @@ func (wa *WebAgent) ProcessStream(ctx AgentContext, callback StreamCallback) err
 func (wa *WebAgent) search(query string) ([]SearchResult, error) {
 	for _, provider := range wa.searchProviders {
 		if provider.Name() == wa.currentProvider {
-			return provider.Search(query)
+			results, err := provider.Search(query)
+			if err == nil && len(results) > 0 {
+				return results, nil
+			}
+			if wa.currentProvider == "bing" && err != nil && len(wa.searchProviders) > 0 {
+				for _, fallback := range wa.searchProviders {
+					if fallback.Name() != "bing" {
+						return fallback.Search(query)
+					}
+				}
+			}
+			return results, err
 		}
 	}
 	if len(wa.searchProviders) > 0 {

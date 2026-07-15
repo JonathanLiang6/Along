@@ -53,7 +53,7 @@ export default function CompanionPage() {
 
   // 当前对话标题
   const activeTitle = useMemo(() => {
-    if (!activeConvId) return '与阿良聊天'
+    if (!activeConvId) return '新对话'
     const conv = conversations.find((c) => c.id === activeConvId)
     return conv?.title || '对话'
   }, [activeConvId, conversations])
@@ -124,9 +124,7 @@ export default function CompanionPage() {
           >
             {sidebarOpen ? <ChevronLeft size={18} /> : <Menu size={18} />}
           </button>
-          <div className="flex-1 min-w-0">
-            <h1 className="font-medium truncate">{activeTitle}</h1>
-          </div>
+          <div className="flex-1" />
           <div className="text-xs text-text-subtle flex items-center gap-1 flex-shrink-0">
             <Sparkles size={14} className="text-primary-400" />
             AI 陪伴
