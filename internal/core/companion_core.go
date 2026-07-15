@@ -4,6 +4,8 @@ import (
 	"ai-companion/internal/agents"
 	"ai-companion/internal/ai"
 	"ai-companion/internal/models"
+	"ai-companion/internal/orchestrator"
+	"ai-companion/internal/pipeline"
 	"ai-companion/internal/services"
 	"fmt"
 	"strings"
@@ -31,6 +33,7 @@ type CompanionCore struct {
 
 	aiClient            *ai.Client
 	agentManager        *agents.AgentManager
+	orchestrator        *orchestrator.Orchestrator
 	memoryService       *services.MemoryService
 	conversationService *services.ConversationService
 	planService         *services.PlanService
@@ -143,6 +146,9 @@ func NewCompanionCore(
 		Keywords:  []string{"生成文档", "生成报告", "保存文档", "导出文档", "生成markdown", "生成md", "周报文档", "报告文档", "文档模板"},
 	})
 
+	// 创建 Orchestrator（LLM规划 + 关键词兜底）
+	cc.orchestrator = orchestrator.New(aiClient, cc.agentManager, memoryService, conversationService, planService)
+
 	return cc
 }
 
@@ -151,6 +157,14 @@ func (cc *CompanionCore) UpdateAIClient(client *ai.Client) {
 	defer cc.mu.Unlock()
 	cc.aiClient = client
 	cc.agentManager.UpdateAIClients(client)
+	if cc.orchestrator != nil {
+		cc.orchestrator.UpdateAIClient(client)
+	}
+}
+
+// GetOrchestrator 获取编排器
+func (cc *CompanionCore) GetOrchestrator() *orchestrator.Orchestrator {
+	return cc.orchestrator
 }
 
 // detectSlashCommand 检测斜杠命令，返回 (command, 参数)
@@ -319,27 +333,28 @@ func (cc *CompanionCore) ProcessMessageStreamInConversation(
 		}
 	}
 
-	ctx, err := cc.buildContextFromConversation(conversationID, effectiveContent)
-	if err != nil {
-		return "", "专业", err
-	}
-
-	_, err = cc.conversationService.SaveMessageToConversation(conversationID, "user", content, "")
-	if err != nil {
-		return "", "专业", err
+	if _, saveErr := cc.conversationService.SaveMessageToConversation(conversationID, "user", content, ""); saveErr != nil {
+		return "", "专业", saveErr
 	}
 
 	cc.conversationService.UpdateConversationTitleByFirstMessage(conversationID, content)
 
 	var fullReply string
-	var finalEmotion = "专业"
+	finalEmotion := "专业"
 
-	err = cc.agentManager.ProcessStream(ctx, func(chunk ai.StreamChunk) {
-		if chunk.Content != "" {
-			fullReply += chunk.Content
+	// 使用 Orchestrator 流式处理
+	procResult, err := cc.orchestrator.ProcessStream(effectiveContent, func(event pipeline.ProgressEvent) {
+		if event.Type == "step_done" || event.Type == "plan_done" {
+			if event.Content != "" && !event.Done {
+				fullReply += event.Content
+			}
 		}
 		if onChunk != nil {
-			onChunk(chunk)
+			onChunk(ai.StreamChunk{
+				Content:      event.Content,
+				Done:         event.Done,
+				FinishReason: event.Type,
+			})
 		}
 	})
 
@@ -352,7 +367,8 @@ func (cc *CompanionCore) ProcessMessageStreamInConversation(
 		return fallback, "专业", err
 	}
 
-	finalEmotion = cc.detectEmotionSimple(content)
+	fullReply = procResult.Content
+	finalEmotion = cc.detectEmotionSimple(effectiveContent)
 	cc.conversationService.SaveMessageToConversation(conversationID, "assistant", fullReply, finalEmotion)
 
 	return fullReply, finalEmotion, nil
@@ -362,41 +378,16 @@ func (cc *CompanionCore) ProcessMessage(content string) (string, string, error) 
 	cc.mu.RLock()
 	defer cc.mu.RUnlock()
 
-	history, _ := cc.conversationService.GetRecentMessages(8)
-	aiHistory := modelsToAIMessages(history)
-
-	mems, _ := cc.memoryService.GetMemories("")
-	var memoryItems []agents.MemoryItem
-	for _, m := range mems {
-		memoryItems = append(memoryItems, agents.MemoryItem{
-			Type:    m.Type,
-			Content: m.Content,
-		})
-	}
-
-	relevantMemories := cc.filterRelevantMemories(memoryItems, content, 6)
-
-	ctx := agents.AgentContext{
-		Content: content,
-		History: aiHistory,
-		Memory:  relevantMemories,
-	}
-
-	result, err := cc.agentManager.Process(ctx)
+	// 使用 Orchestrator（LLM优先 + 关键词兜底，上下文由 Orchestrator 内部注入）
+	procResult, err := cc.orchestrator.Process(content)
 	if err != nil {
 		return "", "专业", err
 	}
 
 	cc.conversationService.SaveMessage("user", content, "")
-	cc.conversationService.SaveMessage("assistant", result.Content, result.Emotion)
+	cc.conversationService.SaveMessage("assistant", procResult.Content, "")
 
-	if len(result.MemoryUpdate) > 0 {
-		for _, mu := range result.MemoryUpdate {
-			cc.memoryService.AddMemory(mu.Type, mu.Content, mu.Source, mu.Confidence)
-		}
-	}
-
-	return result.Content, result.Emotion, nil
+	return procResult.Content, "专业", nil
 }
 
 func (cc *CompanionCore) ProcessMessageStream(
