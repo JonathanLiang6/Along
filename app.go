@@ -13,10 +13,10 @@ import (
 
 	"ai-companion/internal/agents"
 	"ai-companion/internal/ai"
-	"ai-companion/internal/automation"
 	"ai-companion/internal/core"
 	"ai-companion/internal/db"
 	"ai-companion/internal/models"
+	"ai-companion/internal/scheduler"
 	"ai-companion/internal/services"
 
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -33,9 +33,10 @@ type App struct {
 	settings         *services.SettingsService
 	memory           *services.MemoryService
 	conversation     *services.ConversationService
-	plan             *services.PlanService
-	automationEngine *automation.Engine
-	dataDir          string
+	plan               *services.PlanService
+	automationService  *services.AutomationService
+	scheduler          *scheduler.Scheduler
+	dataDir            string
 	shutdownOnce     sync.Once
 	isShuttingDown   bool
 	mu               sync.Mutex
@@ -76,6 +77,7 @@ func NewApp() (*App, error) {
 	app.conversation = services.NewConversationService(app.db)
 	app.conversation.SetConversationsDir(filepath.Join(app.dataDir, "conversations"))
 	app.plan = services.NewPlanService(app.db)
+	app.automationService = services.NewAutomationService(app.db)
 	fmt.Println("服务初始化成功")
 
 	// 初始化默认设置
@@ -119,16 +121,20 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 
-	// 初始化自动化引擎
+	// 初始化调度器
 	if a.db != nil && a.companionCore != nil {
-		a.automationEngine = automation.NewEngine(a.db, a.companionCore.GetAgentManager(), a.dataDir)
-		if err := a.automationEngine.Start(); err != nil {
-			fmt.Println("自动化引擎启动失败:", err)
+		a.scheduler = scheduler.New(a.db, a.dataDir)
+		// 设置 Agent 任务执行回调
+		a.scheduler.OnExecuteAgentTask = func(task *models.AutomationTask) *models.AutomationExecution {
+			return a.executeAutomationTask(task)
+		}
+		if err := a.scheduler.Start(); err != nil {
+			fmt.Println("调度器启动失败:", err)
 		}
 
 		// 设置自动化服务到 companionCore（用于斜杠命令调用）
-		a.companionCore.SetAutomationService(a.automationEngine.GetService())
-		a.companionCore.SetTaskExecutor(a.automationEngine)
+		a.companionCore.SetAutomationService(a.automationService)
+		a.companionCore.SetTaskExecutor(a)
 
 		// 初始化默认的AI前沿知识调研任务
 		a.initDefaultResearchTask()
@@ -236,9 +242,9 @@ func (a *App) QuitApp() {
 		a.isShuttingDown = true
 		a.mu.Unlock()
 
-		if a.automationEngine != nil {
-			a.automationEngine.Stop()
-			a.automationEngine = nil
+		if a.scheduler != nil {
+			a.scheduler.Stop()
+			a.scheduler = nil
 		}
 
 		StopTray()
@@ -342,7 +348,7 @@ func (a *App) ensureDirectories() {
 
 // initDefaultResearchTask 初始化默认的AI前沿知识调研任务
 func (a *App) initDefaultResearchTask() {
-	if a.automationEngine == nil {
+	if a.scheduler == nil {
 		fmt.Println("自动化引擎未初始化，跳过默认任务创建")
 		return
 	}
@@ -389,7 +395,7 @@ func (a *App) ensureDefaultTasks() {
 			RetryIntervalSec: 30,
 			SlashCommand:     "/research",
 		}
-		err = a.automationEngine.GetService().UpdateTask(task)
+		err = a.automationService.UpdateTask(task)
 		if err != nil {
 			fmt.Println("更新调研任务失败:", err)
 			return
@@ -409,7 +415,7 @@ func (a *App) ensureDefaultTasks() {
 			RetryIntervalSec: 30,
 			SlashCommand:     "/research",
 		}
-		taskID, err = a.automationEngine.GetService().CreateTask(task)
+		taskID, err = a.automationService.CreateTask(task)
 		if err != nil {
 			fmt.Println("创建默认调研任务失败:", err)
 			return
@@ -417,7 +423,7 @@ func (a *App) ensureDefaultTasks() {
 		fmt.Println("已创建默认任务: AI前沿知识调研")
 	}
 
-	a.automationEngine.ScheduleTask(taskID)
+	a.scheduler.ScheduleTask(taskID)
 }
 
 // initTaskTemplates 初始化系统任务模板（7个最终版模板）
@@ -1520,18 +1526,18 @@ func (a *App) GetMoodHistory() ([]map[string]string, error) {
 
 // GetAutomationTasks 获取自动化任务列表
 func (a *App) GetAutomationTasks(taskType string) ([]models.AutomationTask, error) {
-	if a.automationEngine == nil {
+	if a.scheduler == nil {
 		return []models.AutomationTask{}, nil
 	}
-	return a.automationEngine.GetService().GetTasks(taskType)
+	return a.automationService.GetTasks(taskType)
 }
 
 // GetAutomationTask 获取单个自动化任务
 func (a *App) GetAutomationTask(id int) (*models.AutomationTask, error) {
-	if a.automationEngine == nil {
+	if a.scheduler == nil {
 		return nil, fmt.Errorf("自动化引擎未初始化")
 	}
-	return a.automationEngine.GetService().GetTask(id)
+	return a.automationService.GetTask(id)
 }
 
 // CreateAutomationTask 创建自动化任务
@@ -1548,13 +1554,13 @@ func (a *App) CreateAutomationTask(name, description, taskType, config, schedule
 		RetryIntervalSec: 30,
 		SlashCommand:     slashCommand,
 	}
-	id, err := a.automationEngine.GetService().CreateTask(task)
+	id, err := a.automationService.CreateTask(task)
 	if err != nil {
 		return 0, err
 	}
 	// 如果启用，加入调度
 	if enabled {
-		a.automationEngine.ScheduleTask(id)
+		a.scheduler.ScheduleTask(id)
 	}
 	return id, nil
 }
@@ -1574,36 +1580,41 @@ func (a *App) UpdateAutomationTask(id int, name, description, taskType, config, 
 		RetryIntervalSec: 30,
 		SlashCommand:     slashCommand,
 	}
-	err := a.automationEngine.GetService().UpdateTask(task)
+	err := a.automationService.UpdateTask(task)
 	if err != nil {
 		return err
 	}
 	// 重新调度
-	return a.automationEngine.ScheduleTask(id)
+	return a.scheduler.ScheduleTask(id)
 }
 
 // DeleteAutomationTask 删除自动化任务
 func (a *App) DeleteAutomationTask(id int) error {
-	a.automationEngine.UnscheduleTask(id)
-	return a.automationEngine.GetService().DeleteTask(id)
+	a.scheduler.UnscheduleTask(id)
+	return a.automationService.DeleteTask(id)
 }
 
 // ToggleAutomationTask 启用/禁用自动化任务
 func (a *App) ToggleAutomationTask(id int, enabled bool) error {
-	err := a.automationEngine.GetService().ToggleTask(id, enabled)
+	err := a.automationService.ToggleTask(id, enabled)
 	if err != nil {
 		return err
 	}
 	if enabled {
-		return a.automationEngine.ScheduleTask(id)
+		return a.scheduler.ScheduleTask(id)
 	}
-	a.automationEngine.UnscheduleTask(id)
+	a.scheduler.UnscheduleTask(id)
 	return nil
+}
+
+// ExecuteTask 实现 core.TaskExecutor 接口（供 companionCore 调用）
+func (a *App) ExecuteTask(taskID int) *models.AutomationExecution {
+	return a.scheduler.ExecuteTask(taskID)
 }
 
 // RunAutomationTaskNow 立即执行自动化任务
 func (a *App) RunAutomationTaskNow(id int) (*models.AutomationExecution, error) {
-	exec := a.automationEngine.ExecuteTask(id)
+	exec := a.scheduler.ExecuteTask(id)
 	if exec == nil {
 		return nil, fmt.Errorf("执行失败")
 	}
@@ -1612,124 +1623,155 @@ func (a *App) RunAutomationTaskNow(id int) (*models.AutomationExecution, error) 
 
 // GetAutomationExecutions 获取执行记录
 func (a *App) GetAutomationExecutions(taskID int) ([]models.AutomationExecution, error) {
-	return a.automationEngine.GetService().GetExecutions(taskID)
+	return a.automationService.GetExecutions(taskID)
 }
 
 // GetAutomationSteps 获取workflow步骤
 func (a *App) GetAutomationSteps(taskID int) ([]models.AutomationStep, error) {
-	return a.automationEngine.GetService().GetSteps(taskID)
+	return a.automationService.GetSteps(taskID)
 }
 
 // SaveAutomationSteps 保存workflow步骤
 func (a *App) SaveAutomationSteps(taskID int, stepsJSON string) error {
-	err := a.automationEngine.GetService().SaveStepsJSON(taskID, stepsJSON)
+	err := a.automationService.SaveStepsJSON(taskID, stepsJSON)
 	if err != nil {
 		return err
 	}
-	return a.automationEngine.ScheduleTask(taskID)
+	return a.scheduler.ScheduleTask(taskID)
 }
 
 // GetStepExecutions 获取步骤执行详情
 func (a *App) GetStepExecutions(executionID int) ([]models.StepExecution, error) {
-	return a.automationEngine.GetService().GetStepExecutions(executionID)
+	return a.automationService.GetStepExecutions(executionID)
 }
 
 // GetAutomationDependencies 获取任务依赖关系
 func (a *App) GetAutomationDependencies(taskID int) ([]models.AutomationDependency, error) {
-	return a.automationEngine.GetService().GetDependencies(taskID)
+	return a.automationService.GetDependencies(taskID)
 }
 
 // GetAutomationDependents 获取依赖于指定任务的任务
 func (a *App) GetAutomationDependents(taskID int) ([]models.AutomationDependency, error) {
-	return a.automationEngine.GetService().GetDependents(taskID)
+	return a.automationService.GetDependents(taskID)
 }
 
 // AddAutomationDependency 添加任务依赖
 func (a *App) AddAutomationDependency(taskID, dependsOnID int, condition string) error {
-	return a.automationEngine.GetService().AddDependency(taskID, dependsOnID, condition)
+	return a.automationService.AddDependency(taskID, dependsOnID, condition)
 }
 
 // RemoveAutomationDependency 删除任务依赖
 func (a *App) RemoveAutomationDependency(id int) error {
-	return a.automationEngine.GetService().RemoveDependency(id)
+	return a.automationService.RemoveDependency(id)
 }
 
 // GetTaskTemplates 获取任务模板列表
 func (a *App) GetTaskTemplates() ([]models.TaskTemplate, error) {
-	if a.db == nil {
+	if a.automationService == nil {
 		return []models.TaskTemplate{}, nil
 	}
-	query := `SELECT id, name, COALESCE(icon, ''), COALESCE(description, ''), task_type,
-				default_config, default_schedule_type, default_schedule_config, steps, is_system,
-				COALESCE(created_at, ''), COALESCE(updated_at, '')
-			  FROM task_templates ORDER BY is_system DESC, id ASC`
-
-	rows, err := a.db.Query(query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var templates []models.TaskTemplate
-	for rows.Next() {
-		var t models.TaskTemplate
-		if err := rows.Scan(&t.ID, &t.Name, &t.Icon, &t.Description, &t.TaskType,
-			&t.DefaultConfig, &t.DefaultScheduleType, &t.DefaultScheduleConfig,
-			&t.Steps, &t.IsSystem, &t.CreatedAt, &t.UpdatedAt); err != nil {
-			continue
-		}
-		templates = append(templates, t)
-	}
-	return templates, nil
+	return a.automationService.GetTaskTemplates()
 }
 
 // GetTaskTemplate 获取单个模板
 func (a *App) GetTaskTemplate(id int) (*models.TaskTemplate, error) {
-	if a.db == nil {
-		return nil, fmt.Errorf("数据库未初始化")
+	if a.automationService == nil {
+		return nil, fmt.Errorf("自动化服务未初始化")
 	}
-	query := `SELECT id, name, COALESCE(icon, ''), COALESCE(description, ''), task_type,
-				default_config, default_schedule_type, default_schedule_config, steps, is_system,
-				COALESCE(created_at, ''), COALESCE(updated_at, '')
-			  FROM task_templates WHERE id = ?`
+	return a.automationService.GetTaskTemplate(id)
+}
 
-	row := a.db.QueryRow(query, id)
-	var t models.TaskTemplate
-	err := row.Scan(&t.ID, &t.Name, &t.Icon, &t.Description, &t.TaskType,
-		&t.DefaultConfig, &t.DefaultScheduleType, &t.DefaultScheduleConfig,
-		&t.Steps, &t.IsSystem, &t.CreatedAt, &t.UpdatedAt)
+// executeAutomationTask 执行自动化任务（通过 Orchestrator）
+func (a *App) executeAutomationTask(task *models.AutomationTask) *models.AutomationExecution {
+	startTime := time.Now()
+	execID, err := a.automationService.CreateExecution(task.ID)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("模板 %d 不存在", id)
-		}
-		return nil, err
+		return &models.AutomationExecution{Status: "failed", ErrorMessage: err.Error()}
 	}
-	return &t, nil
+
+	if a.companionCore == nil {
+		a.automationService.UpdateExecution(execID, "failed", "none", "", "", "系统未初始化", 0)
+		return &models.AutomationExecution{ID: execID, Status: "failed"}
+	}
+
+	// 使用 Orchestrator 规划并执行
+	result, err := a.companionCore.GetOrchestrator().Process(task.Description)
+	status := "success"
+	errMsg := ""
+	content := ""
+	if err != nil {
+		status = "failed"
+		errMsg = err.Error()
+	}
+	if result != nil {
+		content = result.Content
+	}
+
+	duration := time.Since(startTime).Milliseconds()
+	a.automationService.UpdateExecution(execID, status, "text", content, "", errMsg, duration)
+
+	return &models.AutomationExecution{
+		ID:            execID,
+		TaskID:        task.ID,
+		Status:        status,
+		ResultContent: content,
+		ErrorMessage:  errMsg,
+		DurationMs:    duration,
+	}
 }
 
 // CreateTaskFromTemplate 从模板创建任务
 func (a *App) CreateTaskFromTemplate(templateID int, name, description string, scheduleType, scheduleConfig, slashCommand string) (int, error) {
-	id, err := a.automationEngine.GetService().CreateTaskFromTemplate(templateID, name, description, scheduleType, scheduleConfig, slashCommand)
+	id, err := a.automationService.CreateTaskFromTemplate(templateID, name, description, scheduleType, scheduleConfig, slashCommand)
 	if err != nil {
 		return 0, err
 	}
-	a.automationEngine.ScheduleTask(id)
+	a.scheduler.ScheduleTask(id)
 	return id, nil
 }
 
 // GetTaskBySlashCommand 根据斜杠命令获取任务
 func (a *App) GetTaskBySlashCommand(command string) (*models.AutomationTask, error) {
-	return a.automationEngine.GetService().GetTaskBySlashCommand(command)
+	return a.automationService.GetTaskBySlashCommand(command)
 }
 
 // GetTaskConfigSchema 获取任务类型配置表单Schema
 func (a *App) GetTaskConfigSchema(taskType string) ([]models.ConfigField, error) {
-	return a.automationEngine.GetRegistry().GetSchema(taskType), nil
+	return getTaskSchema(taskType), nil
 }
 
 // GetAllTaskSchemas 获取所有任务类型的Schema
 func (a *App) GetAllTaskSchemas() map[string][]models.ConfigField {
-	return a.automationEngine.GetRegistry().GetAllSchemas()
+	return getAllTaskSchemas()
+}
+
+// getTaskSchema 返回指定类型的配置表单字段
+func getTaskSchema(taskType string) []models.ConfigField {
+	schemas := getAllTaskSchemas()
+	if s, ok := schemas[taskType]; ok {
+		return s
+	}
+	return nil
+}
+
+// getAllTaskSchemas 返回所有任务类型的配置表单字段
+func getAllTaskSchemas() map[string][]models.ConfigField {
+	return map[string][]models.ConfigField{
+		"agent_chat": {
+			{Key: "agent_name", Label: "选择Agent", Type: "select", Required: true},
+			{Key: "prompt", Label: "提示词", Type: "textarea", Required: true},
+		},
+		"web_search": {
+			{Key: "query", Label: "搜索关键词", Type: "text", Required: true},
+			{Key: "need_summary", Label: "AI总结", Type: "boolean", Default: "true"},
+		},
+		"reminder": {
+			{Key: "content", Label: "提醒内容", Type: "textarea", Required: true},
+		},
+		"workflow": {
+			{Key: "_notice", Label: "提示", Type: "text", Placeholder: "流程步骤请在步骤管理页面配置"},
+		},
+	}
 }
 
 // ==================== 信息整合与文档生成 ====================
