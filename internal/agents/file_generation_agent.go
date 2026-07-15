@@ -27,6 +27,12 @@ type FileGenerationAgent struct {
 }
 
 // NewFileGenerationAgent 创建文件生成 Agent
+func (fa *FileGenerationAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "file_generation", Description: "按模板生成Markdown文档(research/weekly/meeting/tech_review/general)", InputDesc: "内容和模板类型", OutputDesc: "生成的文件路径"},
+	}
+}
+
 func NewFileGenerationAgent(aiClient *ai.Client) *FileGenerationAgent {
 	return &FileGenerationAgent{
 		BaseAgent: BaseAgent{

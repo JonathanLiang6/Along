@@ -18,6 +18,12 @@ type ReflectionAgent struct {
 }
 
 // NewReflectionAgent 创建复盘 Agent
+func (ra *ReflectionAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "reflection", Description: "周期复盘、成长分析、关系回顾", InputDesc: "复盘周期(day/week/month)", OutputDesc: "结构化复盘报告"},
+	}
+}
+
 func NewReflectionAgent(aiClient *ai.Client, memoryService *services.MemoryService, convService *services.ConversationService) *ReflectionAgent {
 	return &ReflectionAgent{
 		BaseAgent: BaseAgent{

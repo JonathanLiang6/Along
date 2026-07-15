@@ -11,6 +11,12 @@ type EmotionAgent struct {
 	BaseAgent
 }
 
+func (ea *EmotionAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "emotion", Description: "日常对话、情绪支持、陪伴聊天", InputDesc: "用户的聊天内容", OutputDesc: "关怀性回复"},
+	}
+}
+
 // NewEmotionAgent 创建情感陪伴 Agent
 func NewEmotionAgent(aiClient *ai.Client) *EmotionAgent {
 	return &EmotionAgent{

@@ -11,6 +11,12 @@ type PlannerAgent struct {
 	BaseAgent
 }
 
+func (pa *PlannerAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "planner", Description: "目标设定、任务分解、里程碑规划", InputDesc: "计划描述和目标", OutputDesc: "结构化的计划建议"},
+	}
+}
+
 // NewPlannerAgent 创建计划 Agent
 func NewPlannerAgent(aiClient *ai.Client) *PlannerAgent {
 	return &PlannerAgent{

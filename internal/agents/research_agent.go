@@ -26,6 +26,12 @@ func NewResearchAgent(aiClient *ai.Client, webAgent *WebAgent) *ResearchAgent {
 	}
 }
 
+func (ra *ResearchAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "research", Description: "深度调研：多角度搜索、交叉验证", InputDesc: "调研主题", OutputDesc: "结构化调研结果"},
+	}
+}
+
 // Match 计算匹配度
 func (ra *ResearchAgent) Match(ctx AgentContext) float64 {
 	keywords := []string{

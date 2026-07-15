@@ -215,6 +215,12 @@ func NewWebAgent(aiClient *ai.Client) *WebAgent {
 	return wa
 }
 
+func (wa *WebAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "web", Description: "联网搜索、网页内容抓取", InputDesc: "搜索关键词或URL", OutputDesc: "搜索结果和网页内容"},
+	}
+}
+
 func (wa *WebAgent) SetBingAPIKey(apiKey string) {
 	wa.bingAPIKey = apiKey
 	for i, provider := range wa.searchProviders {

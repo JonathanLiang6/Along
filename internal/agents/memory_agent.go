@@ -14,6 +14,12 @@ type MemoryAgent struct {
 }
 
 // NewMemoryAgent 创建记忆 Agent
+func (ma *MemoryAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "memory", Description: "记忆提取、分类存储、回忆查询", InputDesc: "查询关键词或需要记忆的内容", OutputDesc: "相关记忆列表"},
+	}
+}
+
 func NewMemoryAgent(aiClient *ai.Client, memoryService *services.MemoryService) *MemoryAgent {
 	return &MemoryAgent{
 		BaseAgent: BaseAgent{

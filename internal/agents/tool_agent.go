@@ -595,3 +595,10 @@ func (ta *ToolAgent) ProcessStream(ctx AgentContext, callback StreamCallback) er
 func (ta *ToolAgent) UpdateAIClient(client *ai.Client) {
 	ta.aiClient = client
 }
+
+// Capabilities 能力声明
+func (ta *ToolAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "tool", Description: "文件读写、目录浏览、Git操作、浏览器打开", InputDesc: "操作类型和参数", OutputDesc: "操作结果"},
+	}
+}

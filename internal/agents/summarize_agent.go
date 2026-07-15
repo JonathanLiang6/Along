@@ -16,6 +16,12 @@ type SummarizeAgent struct {
 }
 
 // NewSummarizeAgent 创建信息整合 Agent
+func (sa *SummarizeAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "summarize", Description: "信息去重、分类、提炼结构化摘要(brief/detailed/technical)", InputDesc: "原始内容或主题", OutputDesc: "结构化摘要"},
+	}
+}
+
 func NewSummarizeAgent(aiClient *ai.Client, webAgent *WebAgent) *SummarizeAgent {
 	return &SummarizeAgent{
 		BaseAgent: BaseAgent{
