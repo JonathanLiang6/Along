@@ -2,11 +2,15 @@ package pipeline
 
 // Step 流水线中的一个执行步骤
 type Step struct {
-	AgentName string `json:"agent"`            // 要调用的 Agent 名称
-	Input     string `json:"input"`            // 输入内容，支持 {{var}} 变量替换
-	OutputVar string `json:"output_var"`       // 将结果存入此变量名
-	Condition string `json:"condition,omitempty"` // 条件表达式，不满足则跳过
-	OnError   string `json:"on_error,omitempty"` // "skip" 或 "abort"，默认 abort
+	AgentName       string `json:"agent"`                         // 要调用的 Agent 名称
+	Input           string `json:"input"`                         // 输入内容，支持 {{var}} 变量替换
+	OutputVar       string `json:"output_var"`                    // 将结果存入此变量名
+	Condition       string `json:"condition,omitempty"`           // 条件表达式，不满足则跳过
+	OnError         string `json:"on_error,omitempty"`            // "skip" 或 "abort"，默认 abort
+	// 分支跳转：执行完后下一跳的 step_index。
+	// 0 / 负数 / 越界 → 退化为"按数组顺序继续"。
+	NextOnSuccess int `json:"next_on_success,omitempty"`
+	NextOnFailure int `json:"next_on_failure,omitempty"`
 }
 
 // Plan 由 Orchestrator 生成或用户手动编排的执行计划

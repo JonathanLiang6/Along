@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // EvaluateCondition 增强条件表达式求值
@@ -119,12 +120,39 @@ func splitBy(s, sep string) []string {
 	return parts
 }
 
-// resolveVars 替换字符串中的 {{key}} 变量
+// resolveVars 替换字符串中的 {{key}} 变量（含实时时间变量）
 func resolveVars(s string, vars map[string]string) string {
+	// 先替换用户自定义变量
 	for k, v := range vars {
 		s = strings.ReplaceAll(s, fmt.Sprintf("{{%s}}", k), v)
 	}
+
+	// 再替换实时时间变量（精确到当前时刻）
+	now := time.Now()
+	timeVars := map[string]string{
+		"date":     now.Format("2006-01-02"),
+		"time":     now.Format("15:04:05"),
+		"datetime": now.Format("2006-01-02 15:04:05"),
+		"year":     now.Format("2006"),
+		"month":    now.Format("01"),
+		"day":      now.Format("02"),
+		"hour":     now.Format("15"),
+		"minute":   now.Format("04"),
+		"second":   now.Format("05"),
+		"weekday":  chineseWeekday(now.Weekday()),
+		"timestamp": fmt.Sprintf("%d", now.Unix()),
+	}
+	for k, v := range timeVars {
+		s = strings.ReplaceAll(s, fmt.Sprintf("{{%s}}", k), v)
+	}
+
 	return s
+}
+
+// chineseWeekday 返回中文星期
+func chineseWeekday(w time.Weekday) string {
+	names := []string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
+	return names[int(w)]
 }
 
 // evalSingle 求值单个条件表达式
