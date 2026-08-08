@@ -47,7 +47,8 @@ func (ra *ReflectionAgent) Match(ctx AgentContext) float64 {
 
 // Process 同步处理
 func (ra *ReflectionAgent) Process(ctx AgentContext) (*AgentResult, error) {
-	if ra.aiClient == nil {
+	client := ra.GetAIClient()
+	if client == nil {
 		return &AgentResult{
 			Content: "好，我们来复盘。这段时间你做得不错的地方是坚持了下来，可以改进的地方是休息不够。整体来看进展是正向的。",
 			Emotion: "认真",
@@ -79,7 +80,7 @@ func (ra *ReflectionAgent) Process(ctx AgentContext) (*AgentResult, error) {
 	messages = append(messages, ctx.History...)
 	messages = append(messages, ai.Message{Role: "user", Content: ctx.Content})
 
-	resp, err := ra.aiClient.Chat(messages, ai.WithTemperature(0.7), ai.WithMaxTokens(1500))
+	resp, err := client.Chat(messages, ai.WithTemperature(0.7), ai.WithMaxTokens(1500))
 	if err != nil {
 		return &AgentResult{
 			Content: "复盘需要整理一下信息。我们稍后再来梳理这段时间的情况，可以吗？",
@@ -96,7 +97,8 @@ func (ra *ReflectionAgent) Process(ctx AgentContext) (*AgentResult, error) {
 
 // ProcessStream 流式处理
 func (ra *ReflectionAgent) ProcessStream(ctx AgentContext, callback StreamCallback) error {
-	if ra.aiClient == nil {
+	client := ra.GetAIClient()
+	if client == nil {
 		if callback != nil {
 			callback(ai.StreamChunk{Content: "好，我们来复盘。这段时间你做得不错的地方是坚持了下来，可以改进的地方是休息不够。整体来看进展是正向的。", Done: true})
 		}
@@ -128,7 +130,7 @@ func (ra *ReflectionAgent) ProcessStream(ctx AgentContext, callback StreamCallba
 	messages = append(messages, ctx.History...)
 	messages = append(messages, ai.Message{Role: "user", Content: ctx.Content})
 
-	return ra.aiClient.ChatStream(messages, func(chunk ai.StreamChunk) {
+	return client.ChatStream(messages, func(chunk ai.StreamChunk) {
 		if callback != nil {
 			callback(chunk)
 		}
@@ -138,6 +140,7 @@ func (ra *ReflectionAgent) ProcessStream(ctx AgentContext, callback StreamCallba
 // Generate 生成复盘报告
 // period: day / week / month
 func (ra *ReflectionAgent) Generate(period string) (*models.Reflection, error) {
+	client := ra.GetAIClient()
 	end := time.Now()
 	var start time.Time
 	switch period {
@@ -153,7 +156,7 @@ func (ra *ReflectionAgent) Generate(period string) (*models.Reflection, error) {
 	periodStart := start.Format("2006-01-02")
 	periodEnd := end.Format("2006-01-02")
 
-	if ra.aiClient == nil {
+	if client == nil {
 		return &models.Reflection{
 			PeriodStart:          periodStart,
 			PeriodEnd:            periodEnd,
@@ -183,7 +186,7 @@ func (ra *ReflectionAgent) Generate(period string) (*models.Reflection, error) {
   "observations": "总体观察与建议"
 }`, periodStart, periodEnd, period, chatCtx, memCtx)
 
-	resp, err := ra.aiClient.Chat([]ai.Message{
+	resp, err := client.Chat([]ai.Message{
 		{Role: "system", Content: "你是一个有温度的复盘助手。结构化输出 JSON。"},
 		{Role: "user", Content: prompt},
 	}, ai.WithTemperature(0.7), ai.WithMaxTokens(1500))

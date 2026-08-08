@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -251,7 +252,8 @@ func (wa *WebAgent) Match(ctx AgentContext) float64 {
 }
 
 func (wa *WebAgent) Process(ctx AgentContext) (*AgentResult, error) {
-	if wa.aiClient == nil {
+	client := wa.GetAIClient()
+	if client == nil {
 		return &AgentResult{
 			Content: "我可以帮你搜索网络信息。你想了解什么？",
 			Emotion: "认真",
@@ -284,7 +286,7 @@ func (wa *WebAgent) Process(ctx AgentContext) (*AgentResult, error) {
 	messages = append(messages, ctx.History...)
 	messages = append(messages, ai.Message{Role: "user", Content: userMessage})
 
-	resp, err := wa.aiClient.Chat(messages, ai.WithTemperature(0.7))
+	resp, err := client.Chat(messages, ai.WithTemperature(0.7))
 	if err != nil {
 		return &AgentResult{
 			Content: "网络搜索出了点小问题，不过我们可以继续聊聊其他话题。",
@@ -301,7 +303,8 @@ func (wa *WebAgent) Process(ctx AgentContext) (*AgentResult, error) {
 }
 
 func (wa *WebAgent) ProcessStream(ctx AgentContext, callback StreamCallback) error {
-	if wa.aiClient == nil {
+	client := wa.GetAIClient()
+	if client == nil {
 		if callback != nil {
 			callback(ai.StreamChunk{Content: "我可以帮你搜索网络信息。你想了解什么？", Done: true})
 		}
@@ -331,34 +334,56 @@ func (wa *WebAgent) ProcessStream(ctx AgentContext, callback StreamCallback) err
 	messages = append(messages, ctx.History...)
 	messages = append(messages, ai.Message{Role: "user", Content: userMessage})
 
-	return wa.aiClient.ChatStream(messages, func(chunk ai.StreamChunk) {
+	return client.ChatStream(messages, func(chunk ai.StreamChunk) {
 		if callback != nil {
 			callback(chunk)
 		}
 	}, ai.WithTemperature(0.7))
 }
 
+// search 统一搜索入口 + 失败回退
+// 行为：
+//  1. 优先用 currentProvider 搜索；
+//  2. 失败（error）或返回 0 条结果时，按注册顺序回退到其他 provider；
+//  3. 全部失败时返回最后一次的 error。
+// 这样无论默认是 bing 还是 duckduckgo，都能双向回退，
+// 避免出现"duckduckgo 失败但没回退到 bing"导致的搜索质量退化。
 func (wa *WebAgent) search(query string) ([]SearchResult, error) {
-	for _, provider := range wa.searchProviders {
-		if provider.Name() == wa.currentProvider {
-			results, err := provider.Search(query)
-			if err == nil && len(results) > 0 {
-				return results, nil
-			}
-			if wa.currentProvider == "bing" && err != nil && len(wa.searchProviders) > 0 {
-				for _, fallback := range wa.searchProviders {
-					if fallback.Name() != "bing" {
-						return fallback.Search(query)
-					}
-				}
-			}
-			return results, err
+	// 按"当前 provider 优先 + 其它 provider 兜底"的顺序排列尝试列表
+	ordered := make([]SearchProvider, 0, len(wa.searchProviders))
+	seen := make(map[string]bool)
+	for _, p := range wa.searchProviders {
+		if p.Name() == wa.currentProvider {
+			ordered = append(ordered, p)
+			seen[p.Name()] = true
+			break
 		}
 	}
-	if len(wa.searchProviders) > 0 {
-		return wa.searchProviders[0].Search(query)
+	for _, p := range wa.searchProviders {
+		if !seen[p.Name()] {
+			ordered = append(ordered, p)
+			seen[p.Name()] = true
+		}
 	}
-	return nil, fmt.Errorf("未配置搜索源")
+	if len(ordered) == 0 {
+		return nil, fmt.Errorf("未配置搜索源")
+	}
+
+	var lastErr error
+	for _, p := range ordered {
+		results, err := p.Search(query)
+		if err == nil && len(results) > 0 {
+			return results, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+		// err == nil 但结果为空：记下空结果但继续尝试下一个
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, nil
 }
 
 func (wa *WebAgent) getProviderDisplayName() string {
@@ -372,6 +397,64 @@ func (wa *WebAgent) getProviderDisplayName() string {
 	}
 }
 
+// isPrivateHost 判断解析后的 URL 是否指向不应被访问的内网/SSRF 目标
+// 覆盖：IPv4 私网/回环/链路本地（含云元数据 169.254.169.254）、IPv6 私网、
+// 域名形式的 loopback / localhost / 常见内网后缀。
+func isPrivateHost(parsedURL *url.URL) bool {
+	host := parsedURL.Hostname()
+	if host == "" {
+		return true
+	}
+
+	lower := strings.ToLower(host)
+
+	// 1) 字面主机名（loopback、内网后缀、特殊保留名）
+	switch lower {
+	case "localhost", "ip6-localhost", "ip6-loopback", "metadata.google.internal":
+		return true
+	}
+	if strings.HasSuffix(lower, ".localhost") ||
+		strings.HasSuffix(lower, ".local") ||
+		strings.HasSuffix(lower, ".internal") ||
+		strings.HasSuffix(lower, ".intranet") {
+		return true
+	}
+
+	// 2) 解析为 IP 再判断
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+			ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() {
+			return true
+		}
+		// 显式 169.254.0.0/16（云元数据地址）
+		if ip4 := ip.To4(); ip4 != nil {
+			if ip4[0] == 169 && ip4[1] == 254 {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 3) 域名：尝试 DNS 解析为 IP，再判断
+	if ips, err := net.LookupIP(host); err == nil {
+		for _, ip := range ips {
+			if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate() ||
+				ip.IsUnspecified() || ip.IsMulticast() {
+				return true
+			}
+			if ip4 := ip.To4(); ip4 != nil {
+				if ip4[0] == 169 && ip4[1] == 254 {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// FetchPageContent 抓取网页正文
+// 安全加固：限制响应体大小、拒绝内网/SSRF 目标、强制 https 优先。
 func (wa *WebAgent) FetchPageContent(urlStr string) (string, error) {
 	parsedURL, err := url.Parse(urlStr)
 	if err != nil {
@@ -380,6 +463,20 @@ func (wa *WebAgent) FetchPageContent(urlStr string) (string, error) {
 
 	if parsedURL.Scheme == "" {
 		urlStr = "https://" + urlStr
+		parsedURL, err = url.Parse(urlStr)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// 仅允许 http/https scheme
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return "", fmt.Errorf("不支持的协议: %s", parsedURL.Scheme)
+	}
+
+	// SSRF 防护：拒绝内网/云元数据地址
+	if isPrivateHost(parsedURL) {
+		return "", fmt.Errorf("禁止访问内网/本机/云元数据地址: %s", parsedURL.Host)
 	}
 
 	req, err := http.NewRequestWithContext(context.Background(), "GET", urlStr, nil)
@@ -404,9 +501,18 @@ func (wa *WebAgent) FetchPageContent(urlStr string) (string, error) {
 		return "", fmt.Errorf("不支持的内容类型: %s", contentType)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// 限制响应体大小（默认 2MB），防止撑爆内存。
+	// 优先使用 Content-Length 提前拒绝；fallback 用 io.LimitReader 兜底。
+	const maxBodyBytes = 2 * 1024 * 1024
+	if resp.ContentLength > 0 && resp.ContentLength > maxBodyBytes {
+		return "", fmt.Errorf("响应体过大: %d 字节", resp.ContentLength)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if len(body) > maxBodyBytes {
+		return "", fmt.Errorf("响应体超过限制 (%d > %d 字节)", len(body), maxBodyBytes)
 	}
 
 	return wa.extractTextFromHTML(string(body)), nil

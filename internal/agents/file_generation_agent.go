@@ -60,7 +60,8 @@ func (fa *FileGenerationAgent) Match(ctx AgentContext) float64 {
 
 // Process 同步处理
 func (fa *FileGenerationAgent) Process(ctx AgentContext) (*AgentResult, error) {
-	if fa.aiClient == nil {
+	client := fa.GetAIClient()
+	if client == nil {
 		return &AgentResult{
 			Content: "我可以帮你生成格式化的markdown文档。请提供需要格式化的内容。",
 			Emotion: "认真",
@@ -134,7 +135,8 @@ func (fa *FileGenerationAgent) Process(ctx AgentContext) (*AgentResult, error) {
 
 // ProcessStream 流式处理
 func (fa *FileGenerationAgent) ProcessStream(ctx AgentContext, callback StreamCallback) error {
-	if fa.aiClient == nil {
+	client := fa.GetAIClient()
+	if client == nil {
 		if callback != nil {
 			callback(ai.StreamChunk{Content: "我可以帮你生成格式化的markdown文档。请提供需要格式化的内容。", Done: true})
 		}
@@ -154,7 +156,8 @@ func (fa *FileGenerationAgent) ProcessStream(ctx AgentContext, callback StreamCa
 
 // formatDocument 调用 AI 将内容格式化为标准文档
 func (fa *FileGenerationAgent) formatDocument(rawContent, title, template string) (string, error) {
-	if fa.aiClient == nil {
+	client := fa.GetAIClient()
+	if client == nil {
 		return "", fmt.Errorf("AI客户端未初始化")
 	}
 
@@ -190,7 +193,7 @@ func (fa *FileGenerationAgent) formatDocument(rawContent, title, template string
 		{Role: "user", Content: userMessage},
 	}
 
-	resp, err := fa.aiClient.Chat(messages, ai.WithTemperature(0.4), ai.WithMaxTokens(3000))
+	resp, err := client.Chat(messages, ai.WithTemperature(0.4), ai.WithMaxTokens(3000))
 	if err != nil {
 		return "", err
 	}

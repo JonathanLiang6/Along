@@ -42,7 +42,8 @@ func (ma *MemoryAgent) Match(ctx AgentContext) float64 {
 
 // Process 同步处理
 func (ma *MemoryAgent) Process(ctx AgentContext) (*AgentResult, error) {
-	if ma.aiClient == nil {
+	client := ma.GetAIClient()
+	if client == nil {
 		return &AgentResult{
 			Content: "我会记录关于你的重要信息。有什么需要我记住的吗？",
 			Emotion: "专业",
@@ -52,7 +53,7 @@ func (ma *MemoryAgent) Process(ctx AgentContext) (*AgentResult, error) {
 	systemPrompt := ai.BuildSystemPrompt("memory", buildMemoryContext(ctx))
 	messages := buildMessages(ctx, systemPrompt)
 
-	resp, err := ma.aiClient.Chat(messages, ai.WithTemperature(0.7))
+	resp, err := client.Chat(messages, ai.WithTemperature(0.7))
 	if err != nil {
 		return &AgentResult{
 			Content: "我会记录关于你的重要信息。有什么需要我记住的吗？",
@@ -71,7 +72,8 @@ func (ma *MemoryAgent) Process(ctx AgentContext) (*AgentResult, error) {
 
 // ProcessStream 流式处理
 func (ma *MemoryAgent) ProcessStream(ctx AgentContext, callback StreamCallback) error {
-	if ma.aiClient == nil {
+	client := ma.GetAIClient()
+	if client == nil {
 		if callback != nil {
 			callback(ai.StreamChunk{Content: "我会记录关于你的重要信息。有什么需要我记住的吗？", Done: true})
 		}
@@ -81,7 +83,7 @@ func (ma *MemoryAgent) ProcessStream(ctx AgentContext, callback StreamCallback) 
 	systemPrompt := ai.BuildSystemPrompt("memory", buildMemoryContext(ctx))
 	messages := buildMessages(ctx, systemPrompt)
 
-	return ma.aiClient.ChatStream(messages, func(chunk ai.StreamChunk) {
+	return client.ChatStream(messages, func(chunk ai.StreamChunk) {
 		if callback != nil {
 			callback(chunk)
 		}
@@ -90,7 +92,7 @@ func (ma *MemoryAgent) ProcessStream(ctx AgentContext, callback StreamCallback) 
 
 // extractMemories 从对话中提取记忆
 func (ma *MemoryAgent) extractMemories(content string) []MemoryUpdate {
-	if ma.aiClient == nil {
+	if ma.GetAIClient() == nil {
 		return nil
 	}
 
@@ -187,12 +189,12 @@ func (ma *MemoryAgent) SummarizeMemories(memType string, count int) (string, err
 		sb.WriteString(fmt.Sprintf("- [%s] %s\n", mems[i].Type, mems[i].Content))
 	}
 
-	if ma.aiClient == nil {
+	if ma.GetAIClient() == nil {
 		return sb.String(), nil
 	}
 
 	prompt := fmt.Sprintf("请将以下记忆用简短的话总结一下，温暖自然：\n\n%s", sb.String())
-	resp, err := ma.aiClient.Chat([]ai.Message{
+	resp, err := ma.GetAIClient().Chat([]ai.Message{
 		{Role: "system", Content: "你是一个善于总结的助手。"},
 		{Role: "user", Content: prompt},
 	}, ai.WithTemperature(0.7), ai.WithMaxTokens(300))
