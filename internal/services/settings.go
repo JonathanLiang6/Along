@@ -71,12 +71,14 @@ func (s *SettingsService) OnChange(key string, handler SettingChangeHandler) {
 	s.hooks[key] = append(s.hooks[key], handler)
 }
 
-// triggerHooks 触发变更钩子（调用方已持有写锁）
+// triggerHooks 触发变更钩子（调用方应已释放锁）
+// 函数内部会重新获取读锁以安全地快照钩子列表，再在锁外逐个调用，
+// 避免钩子内回调 Get() 时发生 "持写锁取读锁" 的不可重入死锁。
 func (s *SettingsService) triggerHooks(key, oldValue, newValue string) error {
-	hooks := s.hooks[key]
-	if len(hooks) == 0 {
-		return nil
-	}
+	s.mu.RLock()
+	hooks := append([]SettingChangeHandler(nil), s.hooks[key]...)
+	s.mu.RUnlock()
+
 	for _, hook := range hooks {
 		if err := hook(key, oldValue, newValue); err != nil {
 			fmt.Printf("设置变更钩子执行失败 [%s]: %v\n", key, err)
@@ -233,6 +235,9 @@ func (s *SettingsService) decryptIfNeeded(key, value string) string {
 }
 
 // Set 保存设置
+// 注意：写入与触发钩子是分两段进行的。写完数据库后立刻释放锁，
+// 再在锁外调用钩子，避免钩子内反向调用 Get() 时发生
+// "持写锁取读锁"的不可重入死锁。
 func (s *SettingsService) Set(key, value string) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("设置服务未初始化")
@@ -242,18 +247,26 @@ func (s *SettingsService) Set(key, value string) error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	oldValue, _ := s.getUnlocked(key)
 	if oldValue == value {
+		s.mu.Unlock()
 		return nil
 	}
 
 	if err := s.setUnlocked(key, value); err != nil {
+		s.mu.Unlock()
 		return err
 	}
+	// 在锁内复制钩子列表引用，再释放锁后调用钩子。
+	// 这样既保证钩子快照一致，也避免钩子中回调 Get() 时死锁。
+	hooks := append([]SettingChangeHandler(nil), s.hooks[key]...)
+	s.mu.Unlock()
 
-	s.triggerHooks(key, oldValue, value)
+	for _, hook := range hooks {
+		if err := hook(key, oldValue, value); err != nil {
+			fmt.Printf("设置变更钩子执行失败 [%s]: %v\n", key, err)
+		}
+	}
 	return nil
 }
 

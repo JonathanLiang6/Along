@@ -246,13 +246,16 @@ func NotifyNewMessage(msg string) {
 		return
 	}
 	IncrementUnread()
+	// 在锁内同时取出 ctx 与 unreadCount，避免"读 ctx 后锁外读 unreadCount"
+	// 出现数据竞争。
 	tray.mu.Lock()
 	app, ok := tray.ctx.(*App)
+	unread := tray.unreadCount
 	tray.mu.Unlock()
 	if ok && app != nil && app.ctx != nil {
 		wruntime.EventsEmit(app.ctx, "new-message", map[string]interface{}{
 			"content": msg,
-			"unread":  tray.unreadCount,
+			"unread":  unread,
 		})
 	}
 }
