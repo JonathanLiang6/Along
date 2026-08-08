@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { Brain, HeartHandshake, Star, Calendar, Award, Tag, Edit2, Trash2, Save, X, Loader2, AlertCircle, Search, Plus, Sparkles } from 'lucide-react'
+import { hasBackend, getApp } from '../utils/backend'
 
 // PRD 5: 5层记忆体系
 // L1 个人画像 / L2 情感关系 / L3 关键事件 / L4 项目目标 / L5 日常喜好
@@ -25,15 +26,6 @@ const formatDate = (raw) => {
   const m = String(d.getMonth() + 1).padStart(2, '0')
   const day = String(d.getDate()).padStart(2, '0')
   return `${y}-${m}-${day}`
-}
-
-// 判断 window.go 是否可用
-const hasBackend = () => {
-  try {
-    return typeof window !== 'undefined' && window.go && window.go.main && window.go.main.App
-  } catch (e) {
-    return false
-  }
 }
 
 function MemoryPage() {
@@ -62,7 +54,7 @@ function MemoryPage() {
       let result
       if (keyword && keyword.trim()) {
         // 搜索模式
-        result = await window.go.main.App.GlobalSearch(keyword)
+        result = await getApp().GlobalSearch(keyword)
         // 兼容不同的返回结构
         if (Array.isArray(result)) {
           result = { memories: result }
@@ -74,7 +66,7 @@ function MemoryPage() {
         }
         setMemories(allMemories)
       } else {
-        result = await window.go.main.App.GetMemories(typeId || '')
+        result = await getApp().GetMemories(typeId || '')
         const list = Array.isArray(result) ? result : []
         setMemories(list)
       }
@@ -90,7 +82,7 @@ function MemoryPage() {
   const loadCounts = useCallback(async () => {
     if (!hasBackend()) return
     try {
-      const result = await window.go.main.App.GetMemoryCountByType()
+      const result = await getApp().GetMemoryCountByType()
       if (result && typeof result === 'object') {
         setCounts({
           L1: result.L1 || 0,
@@ -143,7 +135,7 @@ function MemoryPage() {
     setActionLoading('update')
     setError(null)
     try {
-      await window.go.main.App.UpdateMemory(editingId, editContent)
+      await getApp().UpdateMemory(editingId, editContent)
       setEditingId(null)
       await loadMemories(activeType, searchKeyword)
       await loadCounts()
@@ -160,7 +152,7 @@ function MemoryPage() {
     setActionLoading(id)
     setError(null)
     try {
-      await window.go.main.App.DeleteMemory(id)
+      await getApp().DeleteMemory(id)
       await loadMemories(activeType, searchKeyword)
       await loadCounts()
     } catch (err) {
@@ -179,7 +171,7 @@ function MemoryPage() {
     setActionLoading('add')
     setError(null)
     try {
-      await window.go.main.App.AddMemory(newMemory.type, newMemory.content.trim(), 'manual', 1.0)
+      await getApp().AddMemory(newMemory.type, newMemory.content.trim(), 'manual', 1.0)
       setShowAddDialog(false)
       setNewMemory({ type: 'L1', content: '' })
       await loadMemories(activeType, searchKeyword)

@@ -1,25 +1,12 @@
 import React, { useState } from 'react'
 import { ArrowRight, ArrowLeft, Loader2, Check, User, Key, Sparkles } from 'lucide-react'
+import { hasBackend, getApp } from '../utils/backend'
 
 const STEPS = {
   WELCOME: 0,
   NAME: 1,
   API_KEY: 2,
   COMPLETE: 3,
-}
-
-// 检查后端是否可用
-const hasBackend = () => {
-  try {
-    return (
-      typeof window !== 'undefined' &&
-      window.go &&
-      window.go.main &&
-      window.go.main.App
-    )
-  } catch (e) {
-    return false
-  }
 }
 
 function OnboardingPage({ onComplete }) {
@@ -54,13 +41,13 @@ function OnboardingPage({ onComplete }) {
         const backend = hasBackend()
         if (backend) {
           // 保存 API Provider
-          await window.go.main.App.SaveSetting('api_provider', apiProvider)
+          await getApp().SaveSetting('api_provider', apiProvider)
           // 保存 API Key（如果填写了）
           if (apiKey.trim()) {
-            await window.go.main.App.SaveSetting('api_key', apiKey.trim())
+            await getApp().SaveSetting('api_key', apiKey.trim())
           }
           // 完成引导流程
-          await window.go.main.App.CompleteOnboarding(userName.trim())
+          await getApp().CompleteOnboarding(userName.trim())
         }
         setStep(STEPS.COMPLETE)
         // 延迟后调用完成回调
@@ -90,8 +77,8 @@ function OnboardingPage({ onComplete }) {
       const backend = hasBackend()
       if (backend) {
         // 即使跳过 API Key，也要保存 provider
-        await window.go.main.App.SaveSetting('api_provider', apiProvider)
-        await window.go.main.App.CompleteOnboarding(userName.trim())
+        await getApp().SaveSetting('api_provider', apiProvider)
+        await getApp().CompleteOnboarding(userName.trim())
       }
       setStep(STEPS.COMPLETE)
       setTimeout(() => {
