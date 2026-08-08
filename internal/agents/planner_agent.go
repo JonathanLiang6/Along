@@ -11,6 +11,12 @@ type PlannerAgent struct {
 	BaseAgent
 }
 
+func (pa *PlannerAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "planner", Description: "目标设定、任务分解、里程碑规划", InputDesc: "计划描述和目标", OutputDesc: "结构化的计划建议"},
+	}
+}
+
 // NewPlannerAgent 创建计划 Agent
 func NewPlannerAgent(aiClient *ai.Client) *PlannerAgent {
 	return &PlannerAgent{
@@ -34,7 +40,8 @@ func (pa *PlannerAgent) Match(ctx AgentContext) float64 {
 
 // Process 同步处理
 func (pa *PlannerAgent) Process(ctx AgentContext) (*AgentResult, error) {
-	if pa.aiClient == nil {
+	client := pa.GetAIClient()
+	if client == nil {
 		return &AgentResult{
 			Content: "我们一起来规划吧。告诉我你想做什么，我来帮你拆分成可以一步步完成的小目标。",
 			Emotion: "认真",
@@ -44,7 +51,7 @@ func (pa *PlannerAgent) Process(ctx AgentContext) (*AgentResult, error) {
 	systemPrompt := ai.BuildSystemPrompt("planner", buildMemoryContext(ctx))
 	messages := buildMessages(ctx, systemPrompt)
 
-	resp, err := pa.aiClient.Chat(messages, ai.WithTemperature(0.7))
+	resp, err := client.Chat(messages, ai.WithTemperature(0.7))
 	if err != nil {
 		return &AgentResult{
 			Content: "我们一起来规划吧。告诉我你想做什么，我来帮你拆分成可以一步步完成的小目标。",
@@ -61,7 +68,8 @@ func (pa *PlannerAgent) Process(ctx AgentContext) (*AgentResult, error) {
 
 // ProcessStream 流式处理
 func (pa *PlannerAgent) ProcessStream(ctx AgentContext, callback StreamCallback) error {
-	if pa.aiClient == nil {
+	client := pa.GetAIClient()
+	if client == nil {
 		if callback != nil {
 			callback(ai.StreamChunk{Content: "我们一起来规划吧。告诉我你想做什么，我来帮你拆分成可以一步步完成的小目标。", Done: true})
 		}
@@ -71,7 +79,7 @@ func (pa *PlannerAgent) ProcessStream(ctx AgentContext, callback StreamCallback)
 	systemPrompt := ai.BuildSystemPrompt("planner", buildMemoryContext(ctx))
 	messages := buildMessages(ctx, systemPrompt)
 
-	return pa.aiClient.ChatStream(messages, func(chunk ai.StreamChunk) {
+	return client.ChatStream(messages, func(chunk ai.StreamChunk) {
 		if callback != nil {
 			callback(chunk)
 		}
@@ -93,7 +101,8 @@ func (pa *PlannerAgent) HandlePlanMessage(content string, history []ai.Message) 
 
 // CreatePlan 创建计划建议
 func (pa *PlannerAgent) CreatePlan(title, description, planType string) (string, error) {
-	if pa.aiClient == nil {
+	client := pa.GetAIClient()
+	if client == nil {
 		return fmt.Sprintf("好的，我们来做「%s」这个%s计划。先从简单的第一步开始吧。", title, planType), nil
 	}
 
@@ -109,7 +118,7 @@ func (pa *PlannerAgent) CreatePlan(title, description, planType string) (string,
 
 以助手的口吻，温暖但专业。`, title, description, planType)
 
-	resp, err := pa.aiClient.Chat([]ai.Message{
+	resp, err := client.Chat([]ai.Message{
 		{Role: "system", Content: ai.BuildSystemPrompt("planner", "")},
 		{Role: "user", Content: prompt},
 	}, ai.WithTemperature(0.7), ai.WithMaxTokens(800))
@@ -123,7 +132,8 @@ func (pa *PlannerAgent) CreatePlan(title, description, planType string) (string,
 
 // MilestoneComment 里程碑完成评论
 func (pa *PlannerAgent) MilestoneComment(milestoneTitle string, goalTitle string) string {
-	if pa.aiClient == nil {
+	client := pa.GetAIClient()
+	if client == nil {
 		return "又完成了一个里程碑，做得好！继续加油。"
 	}
 
@@ -133,7 +143,7 @@ func (pa *PlannerAgent) MilestoneComment(milestoneTitle string, goalTitle string
 
 请用一句话（不超过30字）表示祝贺和鼓励，温暖真诚。`, goalTitle, milestoneTitle)
 
-	resp, err := pa.aiClient.Chat([]ai.Message{
+	resp, err := client.Chat([]ai.Message{
 		{Role: "system", Content: "你是温暖的助手，给用户鼓励。"},
 		{Role: "user", Content: prompt},
 	}, ai.WithTemperature(0.8), ai.WithMaxTokens(100))

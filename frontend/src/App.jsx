@@ -1,12 +1,17 @@
-import React, { useState, useEffect, useCallback } from 'react'
-import { Target, Users, Brain, Settings, Loader2, Search, X, Zap, Bot, User } from 'lucide-react'
-import CompanionPage from './pages/CompanionPage'
-import PlanPage from './pages/PlanPage'
-import UsPage from './pages/UsPage'
-import MemoryPage from './pages/MemoryPage'
-import SettingsPage from './pages/SettingsPage'
-import OnboardingPage from './pages/OnboardingPage'
-import AutomationPage from './pages/AutomationPage'
+import React, { useState, useEffect, useCallback, lazy, Suspense } from 'react'
+import { Target, Users, Brain, Settings, Loader2, Search, X, Zap, Bot } from 'lucide-react'
+import { hasBackend } from './utils/backend'
+import ErrorBoundary from './components/ErrorBoundary'
+import { LoadingSpinner } from './components/ui'
+
+// 代码分割：每个页面按需加载
+const CompanionPage = lazy(() => import('./pages/CompanionPage'))
+const PlanPage = lazy(() => import('./pages/PlanPage'))
+const AutomationPage = lazy(() => import('./pages/automation/AutomationPage'))
+const UsPage = lazy(() => import('./pages/UsPage'))
+const MemoryPage = lazy(() => import('./pages/MemoryPage'))
+const SettingsPage = lazy(() => import('./pages/SettingsPage'))
+const OnboardingPage = lazy(() => import('./pages/OnboardingPage'))
 
 const tabs = [
   { id: 'companion', label: '伙伴', icon: Bot },
@@ -16,18 +21,61 @@ const tabs = [
   { id: 'memory', label: '记忆', icon: Brain },
 ]
 
-// 检查后端是否可用
-const hasBackend = () => {
-  try {
-    return (
-      typeof window !== 'undefined' &&
-      window.go &&
-      window.go.main &&
-      window.go.main.App
-    )
-  } catch (e) {
-    return false
-  }
+// 页面加载中 fallback
+function PageFallback() {
+  return (
+    <div className="flex items-center justify-center h-full min-h-[300px]">
+      <div className="flex items-center gap-2 text-text-muted">
+        <Loader2 className="w-5 h-5 animate-spin" />
+        <span className="text-sm">加载中...</span>
+      </div>
+    </div>
+  )
+}
+
+// 【黑屏修复】Go 后端启动中提示。
+// 后端 asyncInit（DB / 服务 / 调度器 / 托盘等）还在后台进行时，
+// 给用户一个明确的"启动中"状态，而不是空白的"白屏/黑屏"。
+// phaseLabel 是后端 GetInitPhase() 返回的中文文案，会随阶段变化实时更新。
+//
+// 【关键】所有颜色都用 hardcoded 值，不依赖主题变量：
+//   旧版用 bg-bg / text-text（来自 --bg / --text CSS 变量），dark 主题下
+//   --bg = 9 9 17 几乎纯黑，配合浅色 spinner 很容易被误以为"卡死"。
+//   新版用 style 内联浅色背景 + 深色文字，无论 dark/light 都始终清晰可见。
+function BackendBooting({ label = '后台服务初始化中，请稍候…', phaseLabel = '' }) {
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: '#f8fafc',
+        color: '#0f172a',
+        fontFamily: "'Inter', 'Noto Sans SC', system-ui, -apple-system, sans-serif",
+        zIndex: 10000,
+      }}
+    >
+      <div style={{ textAlign: 'center', maxWidth: 360, padding: 24 }}>
+        <div
+          aria-hidden="true"
+          style={{
+            width: 40,
+            height: 40,
+            border: '3px solid #cbd5e1',
+            borderTopColor: '#6366f1',
+            borderRadius: '50%',
+            animation: 'boot-spin 0.9s linear infinite',
+            margin: '0 auto 16px',
+          }}
+        />
+        <style>{`@keyframes boot-spin { to { transform: rotate(360deg); } }`}</style>
+        <div style={{ fontSize: 18, fontWeight: 600, margin: '0 0 6px' }}>Along 正在启动</div>
+        <div style={{ fontSize: 13, color: '#475569' }}>{phaseLabel || label}</div>
+      </div>
+    </div>
+  )
 }
 
 // 应用主题
@@ -58,6 +106,7 @@ function SearchModal({ onClose }) {
     }
     setLoading(true)
     try {
+      if (!hasBackend()) { setResults([]); return }
       const mems = await window.go.main.App.GetMemories('')
       const filtered = (Array.isArray(mems) ? mems : [])
         .filter((m) => (m.content || '').toLowerCase().includes(q.toLowerCase()))
@@ -134,37 +183,119 @@ function App() {
   const [showSearch, setShowSearch] = useState(false)
   const [onboardingComplete, setOnboardingComplete] = useState(null)
   const [checkingOnboarding, setCheckingOnboarding] = useState(true)
-  const [theme, setTheme] = useState('dark')
+  // 【黑屏修复】初始用 light 主题，避免 dark 主题（--bg: 9 9 17 几乎纯黑）
+  // 启动后看起来"一片黑"。BackendBooting 已经是 hardcoded 浅色，但 body
+  // 还是被 index.css 的 background: rgb(var(--bg)) 覆盖。先用 light 让
+  // 整体也保持浅色，等用户进入设置后再切换 dark。
+  const [theme, setTheme] = useState('light')
+  // 【黑屏修复】Go 后端就绪状态：未就绪时显示 BackendBooting 提示，
+  // 而不是渲染可能依赖 Go 方法的子组件。
+  // 不再仅依赖 window.go 是否被注入，而是轮询后端 IsReady() 直到 true。
+  const [backendReady, setBackendReady] = useState(false)
+  // 启动阶段文案（来自后端 GetInitPhase().label）
+  const [initPhaseLabel, setInitPhaseLabel] = useState('正在准备资源…')
 
-  // 启动时加载主题
+  // 启动时加载主题（不依赖后端就绪，本地默认即可）
   useEffect(() => {
-    const backend = hasBackend()
-    if (backend) {
-      window.go.main.App
-        .GetSettings()
-        .then((s) => {
-          if (s && s.theme) {
-            setTheme(s.theme)
-            applyTheme(s.theme)
-          } else {
-            applyTheme('dark')
+    applyTheme('light')
+  }, [])
+
+  // 【黑屏修复核心】轮询后端 IsReady() 状态。
+  // 1) 必须有一个上限（最多 90 秒），避免无限等待
+  // 2) 一旦后端报告就绪，立刻设置 backendReady 触发主界面渲染
+  // 3) 期间通过 GetInitPhase() 持续拉取阶段文案，做到"Along 正在启动 - 加载服务模块…"
+  // 4) 同时监听后端主动推送的 "backend:phase" / "backend:ready" 事件加速收敛
+  useEffect(() => {
+    let attempts = 0
+    const maxAttempts = 900 // 90 秒（每 100ms 一次）
+    let timer = null
+    let cancelled = false
+    let firstPollAt = 0
+
+    const poll = async () => {
+      if (cancelled) return
+      // 先确认 window.go 已注入（前端桥接完成）
+      if (!hasBackend()) {
+        if (attempts === 0) {
+          console.log('[boot] waiting for window.go injection…')
+        }
+        if (attempts < maxAttempts) {
+          attempts++
+          timer = setTimeout(poll, 100)
+        } else {
+          // hasBackend 一直为 false，强制进入 UI（即便有功能故障也至少能进）
+          console.warn('[boot] window.go 注入超时（90s），强制进入主界面')
+          setBackendReady(true)
+        }
+        return
+      }
+      if (firstPollAt === 0) {
+        firstPollAt = Date.now()
+        console.log('[boot] window.go 已就绪，开始轮询后端 IsReady()')
+      }
+      // 拉取阶段文案 + ready
+      try {
+        if (window.go?.main?.App?.GetInitPhase) {
+          const phase = await window.go.main.App.GetInitPhase()
+          if (phase && phase.label) {
+            setInitPhaseLabel(phase.label)
           }
-        })
-        .catch(() => applyTheme('dark'))
-    } else {
-      applyTheme('dark')
+          if (phase && phase.ready) {
+            console.log('[boot] 后端已就绪，总耗时', Date.now() - firstPollAt, 'ms')
+            setBackendReady(true)
+            return
+          }
+        } else {
+          console.warn('[boot] window.go.main.App.GetInitPhase 不存在')
+        }
+      } catch (e) {
+        // GetInitPhase 可能在极端情况下抛错，吞掉继续轮询
+        if (attempts % 20 === 0) {
+          console.warn('[boot] GetInitPhase 调用失败:', e?.message || e)
+        }
+      }
+      if (attempts < maxAttempts) {
+        attempts++
+        timer = setTimeout(poll, 150)
+      } else {
+        // 超时也不再卡死，让 UI 至少能进
+        console.warn('[boot] 轮询 90s 后端仍未就绪，强制进入主界面')
+        setBackendReady(true)
+      }
+    }
+    poll()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
     }
   }, [])
 
-  // 检查引导状态
+  // 监听后端主动推送的阶段事件（asyncInit 完成时会推一次）
   useEffect(() => {
-    const backend = hasBackend()
-    if (!backend) {
-      setOnboardingComplete(true)
-      setCheckingOnboarding(false)
-      return
+    if (!window.runtime || !window.runtime.EventsOn) return
+    const onPhase = (data) => {
+      if (!data) return
+      if (data.label) setInitPhaseLabel(data.label)
+      if (data.ready) setBackendReady(true)
     }
+    const onReady = () => setBackendReady(true)
+    try {
+      window.runtime.EventsOn('backend:phase', onPhase)
+      window.runtime.EventsOn('backend:ready', onReady)
+    } catch (e) {}
+    return () => {
+      try {
+        if (window.runtime && window.runtime.EventsOff) {
+          window.runtime.EventsOff('backend:phase')
+          window.runtime.EventsOff('backend:ready')
+        }
+      } catch (e) {}
+    }
+  }, [])
 
+  // 检查引导状态（仅后端就绪后才发起 Go 方法调用）
+  useEffect(() => {
+    if (!backendReady) return
     const checkOnboarding = async () => {
       try {
         const result = await window.go.main.App.IsOnboardingComplete()
@@ -177,22 +308,19 @@ function App() {
       }
     }
     checkOnboarding()
-  }, [])
+  }, [backendReady])
 
   // 全局快捷键
   useEffect(() => {
     const onKey = (e) => {
-      // Ctrl+K 打开搜索
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault()
         setShowSearch(true)
       }
-      // Ctrl+, 打开设置
       if ((e.ctrlKey || e.metaKey) && e.key === ',') {
         e.preventDefault()
         setShowSettings(true)
       }
-      // ESC 关闭弹窗
       if (e.key === 'Escape') {
         setShowSearch(false)
         setShowSettings(false)
@@ -227,7 +355,6 @@ function App() {
 
   const handleSettingsClose = useCallback((newSettings) => {
     setShowSettings(false)
-    // 重新加载主题
     if (newSettings && newSettings.theme) {
       setTheme(newSettings.theme)
       applyTheme(newSettings.theme)
@@ -235,35 +362,47 @@ function App() {
   }, [])
 
   const renderContent = () => {
-    switch (activeTab) {
-      case 'companion':
-        return <CompanionPage />
-      case 'plan':
-        return <PlanPage />
-      case 'automation':
-        return <AutomationPage />
-      case 'us':
-        return <UsPage />
-      case 'memory':
-        return <MemoryPage />
-      default:
-        return <CompanionPage />
+    // 【黑屏修复】Go 后端未就绪时不渲染子页面，避免子页面在
+    // await window.go.main.App.XXX() 上卡住。
+    if (!backendReady) {
+      return <BackendBooting phaseLabel={initPhaseLabel} />
     }
+    const pageMap = {
+      companion: CompanionPage,
+      plan: PlanPage,
+      automation: AutomationPage,
+      us: UsPage,
+      memory: MemoryPage,
+    }
+    const Page = pageMap[activeTab] || CompanionPage
+    return (
+      <ErrorBoundary key={activeTab}>
+        <Suspense fallback={<PageFallback />}>
+          <Page />
+        </Suspense>
+      </ErrorBoundary>
+    )
+  }
+
+  // 【黑屏修复】未就绪时直接显示启动提示，不再等 onboarding 检查
+  if (!backendReady) {
+    return <BackendBooting phaseLabel={initPhaseLabel} />
   }
 
   if (checkingOnboarding) {
     return (
       <div className="h-screen w-screen flex items-center justify-center bg-bg">
-        <div className="flex items-center gap-2 text-text-muted">
-          <Loader2 className="w-5 h-5 animate-spin" />
-          <span>加载中...</span>
-        </div>
+        <LoadingSpinner text="加载中..." />
       </div>
     )
   }
 
   if (onboardingComplete === false) {
-    return <OnboardingPage onComplete={handleOnboardingComplete} />
+    return (
+      <Suspense fallback={<PageFallback />}>
+        <OnboardingPage onComplete={handleOnboardingComplete} />
+      </Suspense>
+    )
   }
 
   return (
@@ -272,7 +411,7 @@ function App() {
       <header className="h-12 flex items-center justify-between px-4 border-b border-border bg-surface/50 backdrop-blur-sm">
         <div className="flex items-center gap-2">
           <img
-            src="./src/assets/logo.png"
+            src="/logo.png"
             alt="Along"
             className="w-7 h-7 rounded-full object-cover"
             onError={(e) => { e.target.style.display = 'none' }}
@@ -333,9 +472,9 @@ function App() {
 
       {/* 设置弹窗 */}
       {showSettings && (
-        <SettingsPage
-          onClose={() => handleSettingsClose()}
-        />
+        <Suspense fallback={null}>
+          <SettingsPage onClose={() => handleSettingsClose()} />
+        </Suspense>
       )}
     </div>
   )

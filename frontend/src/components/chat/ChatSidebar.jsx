@@ -57,7 +57,7 @@ function ChatSidebar({
       <div className="p-3 border-b border-border">
         <div className="flex items-center justify-center mb-3">
           <img
-            src="./src/assets/logo.png"
+            src="/logo.png"
             alt="Along"
             className="w-8 h-8 rounded-full object-cover"
             onError={(e) => { e.target.style.display = 'none' }}

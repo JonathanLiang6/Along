@@ -16,6 +16,12 @@ type SummarizeAgent struct {
 }
 
 // NewSummarizeAgent 创建信息整合 Agent
+func (sa *SummarizeAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "summarize", Description: "信息去重、分类、提炼结构化摘要(brief/detailed/technical)", InputDesc: "原始内容或主题", OutputDesc: "结构化摘要"},
+	}
+}
+
 func NewSummarizeAgent(aiClient *ai.Client, webAgent *WebAgent) *SummarizeAgent {
 	return &SummarizeAgent{
 		BaseAgent: BaseAgent{
@@ -38,7 +44,8 @@ func (sa *SummarizeAgent) Match(ctx AgentContext) float64 {
 
 // Process 同步处理
 func (sa *SummarizeAgent) Process(ctx AgentContext) (*AgentResult, error) {
-	if sa.aiClient == nil {
+	client := sa.GetAIClient()
+	if client == nil {
 		return &AgentResult{
 			Content: "我可以帮你整合信息。请提供需要整理的内容或主题。",
 			Emotion: "认真",
@@ -101,7 +108,8 @@ func (sa *SummarizeAgent) Process(ctx AgentContext) (*AgentResult, error) {
 
 // ProcessStream 流式处理
 func (sa *SummarizeAgent) ProcessStream(ctx AgentContext, callback StreamCallback) error {
-	if sa.aiClient == nil {
+	client := sa.GetAIClient()
+	if client == nil {
 		if callback != nil {
 			callback(ai.StreamChunk{Content: "我可以帮你整合信息。请提供需要整理的内容或主题。", Done: true})
 		}
@@ -164,7 +172,8 @@ func (sa *SummarizeAgent) formatSearchResults(results []SearchResult) string {
 
 // generateSummary 调用 AI 生成结构化摘要
 func (sa *SummarizeAgent) generateSummary(topic, sourceText, summaryType string) (string, error) {
-	if sa.aiClient == nil {
+	client := sa.GetAIClient()
+	if client == nil {
 		return "", fmt.Errorf("AI客户端未初始化")
 	}
 
@@ -212,7 +221,7 @@ func (sa *SummarizeAgent) generateSummary(topic, sourceText, summaryType string)
 		{Role: "user", Content: userMessage},
 	}
 
-	resp, err := sa.aiClient.Chat(messages, ai.WithTemperature(0.5), ai.WithMaxTokens(2500))
+	resp, err := client.Chat(messages, ai.WithTemperature(0.5), ai.WithMaxTokens(2500))
 	if err != nil {
 		return "", err
 	}

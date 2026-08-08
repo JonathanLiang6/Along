@@ -363,12 +363,32 @@ func ParseScheduleConfig(scheduleType, config string) (string, error) {
 	}
 
 	switch scheduleType {
-	case "custom":
-		cron, _ := cfg["cron"].(string)
-		if cron == "" {
-			return "", fmt.Errorf("custom类型需要cron字段")
+	case "interval":
+		// 用户友好：interval_num + interval_unit → cron
+		intervalNum := 30
+		if n, ok := cfg["interval_num"].(float64); ok && n > 0 {
+			intervalNum = int(n)
 		}
-		return cron, nil
+		intervalUnit, _ := cfg["interval_unit"].(string)
+		if intervalUnit == "" {
+			intervalUnit = "minutes"
+		}
+
+		if intervalUnit == "hours" {
+			// 每N小时 → 在指定分钟执行
+			if intervalNum > 23 {
+				intervalNum = 23
+			}
+			return fmt.Sprintf("0 */%d * * *", intervalNum), nil
+		}
+		// 每N分钟
+		if intervalNum < 1 {
+			intervalNum = 1
+		}
+		if intervalNum > 1440 {
+			intervalNum = 1440
+		}
+		return fmt.Sprintf("*/%d * * * *", intervalNum), nil
 
 	case "daily":
 		timeStr, _ := cfg["time"].(string)
@@ -408,17 +428,6 @@ func ParseScheduleConfig(scheduleType, config string) (string, error) {
 			dayOfMonth = int(d)
 		}
 		return fmt.Sprintf("%d %d %d * *", minute, hour, dayOfMonth), nil
-
-	case "interval":
-		seconds := 300
-		if s, ok := cfg["seconds"].(float64); ok {
-			seconds = int(s)
-		}
-		minutes := seconds / 60
-		if minutes < 1 {
-			minutes = 1
-		}
-		return fmt.Sprintf("*/%d * * * *", minutes), nil
 
 	default:
 		return "", fmt.Errorf("不支持的调度类型: %s", scheduleType)

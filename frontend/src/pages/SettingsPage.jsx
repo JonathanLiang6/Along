@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { X, Key, Monitor, Database, Shield, Moon, Sun, MonitorDot } from 'lucide-react'
+import { hasBackend, getApp } from '../utils/backend'
 
 function SettingsPage({ onClose }) {
   const [activeTab, setActiveTab] = useState('api')
@@ -31,15 +32,6 @@ function SettingsPage({ onClose }) {
   const showStatus = useCallback((type, msg, tab = null) => {
     setStatusMsg({ type, msg, tab })
     setTimeout(() => setStatusMsg(null), 3000)
-  }, [])
-
-  // 获取后端 App 对象
-  const getApp = useCallback(() => {
-    if (typeof window === 'undefined') return null
-    if (!window.go || !window.go.main || !window.go.main || !window.go.main.App) {
-      return null
-    }
-    return window.go.main.App
   }, [])
 
   // 组件加载时从后端加载所有设置
@@ -379,7 +371,7 @@ function SettingsPage({ onClose }) {
                   onChange={(e) => {
                     setFontSize(e.target.value)
                     document.documentElement.style.fontSize = e.target.value
-                    window.go?.main?.App?.SaveSetting('font_size', e.target.value)
+                    getApp()?.SaveSetting('font_size', e.target.value)
                   }}
                   className="bg-surface border border-border rounded-lg px-3 py-1.5 text-sm text-text focus:outline-none focus:border-primary-400"
                 >
@@ -503,7 +495,7 @@ function SettingsPage({ onClose }) {
                 <button
                   onClick={() => {
                     if (window.confirm('确定要退出应用吗？')) {
-                      window.go?.main?.App?.QuitApp?.()
+                      getApp()?.QuitApp?.()
                     }
                   }}
                   className="px-4 py-1.5 text-sm bg-danger-500 text-white rounded-lg hover:bg-danger-600 transition-colors"

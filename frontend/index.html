@@ -4,9 +4,107 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Along</title>
+  <!--
+    【黑屏彻底修复】静态加载屏（不依赖 JS / CSS 变量 / 主题）。
+    之前的实现：<div id="root"></div> 是空的，body 背景依赖 :root --bg 变量，
+    在某些场景（CSS 变量未及时生效、WebView2 初始化缓慢、JS bundle 加载中）
+    用户会看到一段空白的纯背景色窗口，看起来就是"黑屏"。
+
+    新方案：在 JS / React 接管渲染之前，先用一段 hardcoded 的 HTML + inline CSS
+    展示一个明显的"正在启动"界面，包含：
+      - 浅色背景 + 深色文字（无论 dark/light 主题都可见）
+      - 旋转动画
+      - 错误兜底：30 秒后仍未被 React 接管，显示错误提示（说明可能是 JS 加载失败）
+      - 真正的 React 加载完成后，由 main.jsx 立刻移除此节点
+  -->
+  <style>
+    /* inline 样式：避免被外部 CSS / 主题变量影响 */
+    html, body { margin: 0; padding: 0; height: 100%; }
+    #boot-splash {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #f8fafc; /* 浅灰背景 */
+      color: #0f172a;       /* 深色文字 */
+      font-family: 'Inter', 'Noto Sans SC', system-ui, -apple-system, sans-serif;
+      z-index: 9999;
+    }
+    #boot-splash .boot-card {
+      text-align: center;
+      max-width: 360px;
+      padding: 24px;
+    }
+    #boot-splash .boot-spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid #cbd5e1;
+      border-top-color: #6366f1;
+      border-radius: 50%;
+      animation: boot-spin 0.9s linear infinite;
+      margin: 0 auto 16px;
+    }
+    @keyframes boot-spin {
+      to { transform: rotate(360deg); }
+    }
+    #boot-splash .boot-title {
+      font-size: 18px;
+      font-weight: 600;
+      margin: 0 0 6px;
+      color: #0f172a;
+    }
+    #boot-splash .boot-sub {
+      font-size: 13px;
+      color: #475569;
+      margin: 0;
+    }
+    #boot-splash.boot-err .boot-spinner { display: none; }
+    #boot-splash.boot-err .boot-title { color: #b91c1c; }
+    #boot-splash.boot-err {
+      background: #fef2f2;
+    }
+  </style>
 </head>
 <body>
+  <!-- React 挂载点 -->
   <div id="root"></div>
+
+  <!-- 静态加载屏：JS 启动前由浏览器渲染，被 main.jsx 接管后移除 -->
+  <div id="boot-splash" role="status" aria-live="polite">
+    <div class="boot-card">
+      <div class="boot-spinner" aria-hidden="true"></div>
+      <p class="boot-title">Along 正在启动</p>
+      <p class="boot-sub">正在加载界面资源…</p>
+    </div>
+  </div>
+
+  <!--
+    超时兜底：如果 30 秒后 boot-splash 还在（说明 React 没能接管渲染），
+    自动切到错误态，告诉用户"界面初始化失败"而不是永远"启动中"。
+    这是 WebView2 / JS bundle 加载失败的最后一道视觉防线。
+  -->
+  <script>
+    (function () {
+      try {
+        setTimeout(function () {
+          var el = document.getElementById('boot-splash');
+          if (!el) return; // 已被 React 移除
+          // React 还没接管，说明 JS 执行失败 / 加载超时
+          el.classList.add('boot-err');
+          var title = el.querySelector('.boot-title');
+          var sub = el.querySelector('.boot-sub');
+          if (title) title.textContent = '界面初始化失败';
+          if (sub) sub.textContent = '请重启程序或检查 WebView2 运行时';
+          // 输出到控制台方便排查
+          if (window.console && console.error) {
+            console.error('[boot-splash] 30s 内 React 未接管渲染，可能 JS 加载失败');
+          }
+        }, 30000);
+      } catch (e) {}
+    })();
+  </script>
+
   <script type="module" src="/src/main.jsx"></script>
 </body>
 </html>

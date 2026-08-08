@@ -4,6 +4,8 @@ import (
 	"ai-companion/internal/agents"
 	"ai-companion/internal/ai"
 	"ai-companion/internal/models"
+	"ai-companion/internal/orchestrator"
+	"ai-companion/internal/pipeline"
 	"ai-companion/internal/services"
 	"fmt"
 	"strings"
@@ -31,6 +33,7 @@ type CompanionCore struct {
 
 	aiClient            *ai.Client
 	agentManager        *agents.AgentManager
+	orchestrator        *orchestrator.Orchestrator
 	memoryService       *services.MemoryService
 	conversationService *services.ConversationService
 	planService         *services.PlanService
@@ -143,6 +146,9 @@ func NewCompanionCore(
 		Keywords:  []string{"生成文档", "生成报告", "保存文档", "导出文档", "生成markdown", "生成md", "周报文档", "报告文档", "文档模板"},
 	})
 
+	// 创建 Orchestrator（LLM规划 + 关键词兜底）
+	cc.orchestrator = orchestrator.New(aiClient, cc.agentManager, memoryService, conversationService, planService)
+
 	return cc
 }
 
@@ -151,6 +157,14 @@ func (cc *CompanionCore) UpdateAIClient(client *ai.Client) {
 	defer cc.mu.Unlock()
 	cc.aiClient = client
 	cc.agentManager.UpdateAIClients(client)
+	if cc.orchestrator != nil {
+		cc.orchestrator.UpdateAIClient(client)
+	}
+}
+
+// GetOrchestrator 获取编排器
+func (cc *CompanionCore) GetOrchestrator() *orchestrator.Orchestrator {
+	return cc.orchestrator
 }
 
 // detectSlashCommand 检测斜杠命令，返回 (command, 参数)
@@ -202,6 +216,9 @@ func (cc *CompanionCore) buildContextFromConversation(conversationID int, conten
 }
 
 // filterRelevantMemories 过滤与当前内容相关的记忆
+// 当没有关键词命中时（relevant 为空）且总记忆超过 limit，
+// 不能直接返回空切片，否则上游会完全丢失记忆上下文。
+// 此时应回退到按出现顺序取前 limit 条，保证至少有"概览"级别的上下文。
 func (cc *CompanionCore) filterRelevantMemories(mems []agents.MemoryItem, content string, limit int) []agents.MemoryItem {
 	if len(mems) == 0 {
 		return mems
@@ -219,11 +236,38 @@ func (cc *CompanionCore) filterRelevantMemories(mems []agents.MemoryItem, conten
 		}
 	}
 
-	if len(relevant) == 0 && len(mems) <= limit {
-		return mems[:min(len(mems), limit)]
+	// 无命中时回退到 top-N（按出现顺序），避免上下文完全丢失。
+	if len(relevant) == 0 {
+		n := min(len(mems), limit)
+		out := make([]agents.MemoryItem, n)
+		copy(out, mems[:n])
+		return out
 	}
 
 	return relevant
+}
+
+// parseMessageTimestamp 解析数据库消息时间戳
+// SQLite 默认 datetime('now') 输出格式为 "2006-01-02 15:04:05"，
+// 但历史数据/前端写入可能使用 RFC3339（"2006-01-02T15:04:05Z07:00"）。
+// 此处按"最常见→最严格"顺序尝试，失败时返回零值而不是让上游误判。
+func parseMessageTimestamp(ts string) time.Time {
+	if ts == "" {
+		return time.Time{}
+	}
+	layouts := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05.000",
+		time.RFC3339,
+		time.RFC3339Nano,
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, ts); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 func min(a, b int) int {
@@ -234,112 +278,198 @@ func min(a, b int) int {
 }
 
 // ProcessMessageStreamInConversation 在指定对话中流式处理消息
+//
+// 【黑屏修复 / 死锁修复】重要：不持长锁！
+// 旧实现从函数开始到结束全程持有 cc.mu.RLock()，这意味着：
+//   1) 一次普通对话的 LLM 流式响应可能耗时 10~120 秒
+//   2) 在这 10~120 秒内，任何写锁调用（UpdateAIClient / SetAutomationService
+//      / SetTaskExecutor 等）都会被永久阻塞
+//   3) 如果写锁调用方正持有 resources 等待本函数返回 → 死锁 → Wails 主循环
+//      事件无法派发 → 启动卡死 → 看起来"黑屏"
+// 新实现采用"快照 → 释放锁 → 业务处理"模式：先把需要的字段快照出来，释放
+// 锁后再做真正的 LLM / 持久化工作。这样任何时刻只持锁几毫秒。
 func (cc *CompanionCore) ProcessMessageStreamInConversation(
 	conversationID int,
 	content string,
 	onChunk func(chunk ai.StreamChunk),
 ) (string, string, error) {
+	// ============ 阶段 1：在锁内完成"读字段 → 决策 → 派活" ============
+	type slashPlan struct {
+		kind         string // "automation" / "builtin" / ""
+		effective    string
+		taskID       int
+		taskName     string
+		hasExecutor  bool
+		hasAutoSvc   bool
+		replyPrefix  string
+		conversation *services.ConversationService
+		automation   *services.AutomationService
+	}
+
+	var plan slashPlan
+	var builtinCmd, builtinArg string
+
 	cc.mu.RLock()
-	defer cc.mu.RUnlock()
+	builtinCmd, builtinArg = detectSlashCommand(content)
+	plan.hasAutoSvc = cc.automationService != nil
+	plan.automation = cc.automationService
+	plan.conversation = cc.conversationService
+	plan.hasExecutor = cc.taskExecutor != nil
+	cc.mu.RUnlock()
 
-	cmd, arg := detectSlashCommand(content)
-	effectiveContent := content
-
-	if cmd != "" {
-		if cc.automationService != nil {
-			task, err := cc.automationService.GetTaskBySlashCommand("/" + cmd)
+	// ============ 阶段 2：处理斜杠命令（同样不持锁） ============
+	if builtinCmd != "" {
+		// 1) 自动化任务斜杠命令
+		if plan.hasAutoSvc {
+			task, err := plan.automation.GetTaskBySlashCommand("/" + builtinCmd)
 			if err == nil && task != nil && task.ID > 0 {
-				_, _ = cc.conversationService.SaveMessageToConversation(conversationID, "user", content, "")
-				cc.conversationService.UpdateConversationTitleByFirstMessage(conversationID, content)
+				plan.kind = "automation"
+				plan.taskID = task.ID
+				plan.taskName = task.Name
+				plan.replyPrefix = "正在执行任务：" + plan.taskName + "，请稍候..."
+			}
+		}
 
-				reply := "正在执行任务：" + task.Name + "，请稍候..."
-				if onChunk != nil {
-					onChunk(ai.StreamChunk{Content: reply, Done: false})
-				}
-
-				if taskExecutor, ok := cc.getTaskExecutor(); ok {
-					go func() {
-						exec := taskExecutor.ExecuteTask(task.ID)
-						resultMsg := ""
-						if exec.Status == "success" {
-							resultMsg = "\n\n✅ 任务执行完成！"
-							if exec.ResultContent != "" {
-								if len(exec.ResultContent) > 2000 {
-									resultMsg += "\n\n" + exec.ResultContent[:2000] + "\n...（内容已截断）"
-								} else {
-									resultMsg += "\n\n" + exec.ResultContent
-								}
-							}
-							if exec.ResultPath != "" {
-								resultMsg += "\n\n📁 输出文件: " + exec.ResultPath
-							}
-						} else if exec.Status == "failed" {
-							resultMsg = "\n\n❌ 任务执行失败: " + exec.ErrorMessage
-						} else {
-							resultMsg = "\n\n⏳ 任务已提交，正在执行中..."
-						}
-						if onChunk != nil {
-							onChunk(ai.StreamChunk{Content: resultMsg, Done: true})
-						}
-						fullReply := reply + resultMsg
-						cc.conversationService.SaveMessageToConversation(conversationID, "assistant", fullReply, "专业")
-					}()
+		// 2) 内置命令（plan / review / memory）
+		if plan.kind == "" {
+			switch builtinCmd {
+			case "plan":
+				if builtinArg != "" {
+					plan.effective = "帮我制定一个关于「" + builtinArg + "」的计划，分解成可执行的步骤。"
 				} else {
-					if onChunk != nil {
-						onChunk(ai.StreamChunk{Content: "\n\n任务已提交执行。", Done: true})
-					}
-					fullReply := reply + "\n\n任务已提交执行。"
-					cc.conversationService.SaveMessageToConversation(conversationID, "assistant", fullReply, "专业")
+					plan.effective = "帮我制定一个计划，分解成可执行的步骤。"
 				}
-
-				return reply, "专业", nil
+				plan.kind = "builtin"
+			case "review":
+				period := "本周"
+				if builtinArg != "" {
+					period = builtinArg
+				}
+				plan.effective = "帮我回顾一下" + period + "的情况，做一个总结。"
+				plan.kind = "builtin"
+			case "memory":
+				if builtinArg != "" {
+					plan.effective = "帮我回忆一下关于「" + builtinArg + "」的事情。"
+				} else {
+					plan.effective = "请列出你记得的关于我的事情。"
+				}
+				plan.kind = "builtin"
+			default:
 			}
 		}
+	}
 
-		switch cmd {
-		case "plan":
-			if arg != "" {
-				effectiveContent = "帮我制定一个关于「" + arg + "」的计划，分解成可执行的步骤。"
-			} else {
-				effectiveContent = "帮我制定一个计划，分解成可执行的步骤。"
-			}
-		case "review":
-			period := "本周"
-			if arg != "" {
-				period = arg
-			}
-			effectiveContent = "帮我回顾一下" + period + "的情况，做一个总结。"
-		case "memory":
-			if arg != "" {
-				effectiveContent = "帮我回忆一下关于「" + arg + "」的事情。"
-			} else {
-				effectiveContent = "请列出你记得的关于我的事情。"
-			}
-		default:
+	effectiveContent := content
+	if plan.kind == "builtin" {
+		effectiveContent = plan.effective
+	}
+
+	// ============ 阶段 3：自动化任务的"占位 + 异步"派活 ============
+	if plan.kind == "automation" {
+		conv := plan.conversation
+		if conv == nil {
+			return "", "专业", fmt.Errorf("对话服务未初始化")
 		}
+		if _, saveErr := conv.SaveMessageToConversation(conversationID, "user", content, ""); saveErr != nil {
+			return "", "专业", saveErr
+		}
+		conv.UpdateConversationTitleByFirstMessage(conversationID, content)
+
+		reply := plan.replyPrefix
+		if onChunk != nil {
+			onChunk(ai.StreamChunk{Content: reply, Done: false})
+		}
+
+		if !plan.hasExecutor {
+			if onChunk != nil {
+				onChunk(ai.StreamChunk{Content: "\n\n任务已提交执行。", Done: true})
+			}
+			fullReply := reply + "\n\n任务已提交执行。"
+			conv.SaveMessageToConversation(conversationID, "assistant", fullReply, "专业")
+			return reply, "专业", nil
+		}
+
+		// 把任务执行放到独立 goroutine，避免主流程等 LLM 阻塞
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("[ProcessMessageStreamInConversation] 任务执行 panic: %v\n", r)
+				}
+			}()
+			// 关键修复：再次取一次 executor，避免与 SetTaskExecutor 写锁冲突
+			cc.mu.RLock()
+			exec := cc.taskExecutor
+			cc.mu.RUnlock()
+			if exec == nil {
+				return
+			}
+			taskExec := exec.ExecuteTask(plan.taskID)
+			resultMsg := ""
+			if taskExec.Status == "success" {
+				resultMsg = "\n\n✅ 任务执行完成！"
+				if taskExec.ResultContent != "" {
+					if len(taskExec.ResultContent) > 2000 {
+						resultMsg += "\n\n" + taskExec.ResultContent[:2000] + "\n...（内容已截断）"
+					} else {
+						resultMsg += "\n\n" + taskExec.ResultContent
+					}
+				}
+				if taskExec.ResultPath != "" {
+					resultMsg += "\n\n📁 输出文件: " + taskExec.ResultPath
+				}
+			} else if taskExec.Status == "failed" {
+				resultMsg = "\n\n❌ 任务执行失败: " + taskExec.ErrorMessage
+			} else {
+				resultMsg = "\n\n⏳ 任务已提交，正在执行中..."
+			}
+			if onChunk != nil {
+				onChunk(ai.StreamChunk{Content: resultMsg, Done: true})
+			}
+			fullReply := reply + resultMsg
+			conv.SaveMessageToConversation(conversationID, "assistant", fullReply, "专业")
+		}()
+
+		return reply, "专业", nil
 	}
 
-	ctx, err := cc.buildContextFromConversation(conversationID, effectiveContent)
-	if err != nil {
-		return "", "专业", err
+	// ============ 阶段 4：常规消息（不持锁，调用 Orchestrator） ============
+	conv := plan.conversation
+	if conv == nil {
+		return "", "专业", fmt.Errorf("对话服务未初始化")
 	}
 
-	_, err = cc.conversationService.SaveMessageToConversation(conversationID, "user", content, "")
-	if err != nil {
-		return "", "专业", err
+	if _, saveErr := conv.SaveMessageToConversation(conversationID, "user", content, ""); saveErr != nil {
+		return "", "专业", saveErr
 	}
-
-	cc.conversationService.UpdateConversationTitleByFirstMessage(conversationID, content)
+	conv.UpdateConversationTitleByFirstMessage(conversationID, content)
 
 	var fullReply string
-	var finalEmotion = "专业"
+	finalEmotion := "专业"
 
-	err = cc.agentManager.ProcessStream(ctx, func(chunk ai.StreamChunk) {
-		if chunk.Content != "" {
-			fullReply += chunk.Content
+	// 关键修复：不持 cc.mu 锁调用 Orchestrator。
+	// Orchestrator 内部自己有 aiClient 锁，调用期间即便 SetAutomationService
+	// 等写锁等待也不会再与本函数死锁。
+	// 期间通过 aiClient 字段的短锁读取来保持与 UpdateAIClient 的安全。
+	cc.mu.RLock()
+	orch := cc.orchestrator
+	cc.mu.RUnlock()
+	if orch == nil {
+		return "", "专业", fmt.Errorf("编排器未初始化")
+	}
+
+	procResult, err := orch.ProcessStream(effectiveContent, func(event pipeline.ProgressEvent) {
+		if event.Type == "step_done" && !event.Done && event.Content != "" {
+			if fullReply != "" {
+				fullReply += "\n\n"
+			}
+			fullReply += event.Content
 		}
 		if onChunk != nil {
-			onChunk(chunk)
+			onChunk(ai.StreamChunk{
+				Content:      event.Content,
+				Done:         event.Done,
+				FinishReason: event.Type,
+			})
 		}
 	})
 
@@ -348,64 +478,59 @@ func (cc *CompanionCore) ProcessMessageStreamInConversation(
 		if onChunk != nil {
 			onChunk(ai.StreamChunk{Content: fallback, Done: true})
 		}
-		cc.conversationService.SaveMessageToConversation(conversationID, "assistant", fallback, "专业")
+		conv.SaveMessageToConversation(conversationID, "assistant", fallback, "专业")
 		return fallback, "专业", err
 	}
 
-	finalEmotion = cc.detectEmotionSimple(content)
-	cc.conversationService.SaveMessageToConversation(conversationID, "assistant", fullReply, finalEmotion)
+	if fullReply == "" {
+		fullReply = procResult.Content
+	}
+	finalEmotion = cc.detectEmotionSimple(effectiveContent)
+	conv.SaveMessageToConversation(conversationID, "assistant", fullReply, finalEmotion)
 
 	return fullReply, finalEmotion, nil
 }
 
 func (cc *CompanionCore) ProcessMessage(content string) (string, string, error) {
+	// 关键修复：不持长锁调用 Orchestrator。
+	// 之前 defer cc.mu.RUnlock() 会让整个 LLM 同步调用期间持有读锁，
+	// 与 UpdateAIClient 等写锁形成潜在死锁路径。
 	cc.mu.RLock()
-	defer cc.mu.RUnlock()
+	orch := cc.orchestrator
+	conv := cc.conversationService
+	cc.mu.RUnlock()
 
-	history, _ := cc.conversationService.GetRecentMessages(8)
-	aiHistory := modelsToAIMessages(history)
-
-	mems, _ := cc.memoryService.GetMemories("")
-	var memoryItems []agents.MemoryItem
-	for _, m := range mems {
-		memoryItems = append(memoryItems, agents.MemoryItem{
-			Type:    m.Type,
-			Content: m.Content,
-		})
+	if orch == nil {
+		return "", "专业", fmt.Errorf("编排器未初始化")
 	}
 
-	relevantMemories := cc.filterRelevantMemories(memoryItems, content, 6)
-
-	ctx := agents.AgentContext{
-		Content: content,
-		History: aiHistory,
-		Memory:  relevantMemories,
-	}
-
-	result, err := cc.agentManager.Process(ctx)
+	procResult, err := orch.Process(content)
 	if err != nil {
 		return "", "专业", err
 	}
 
-	cc.conversationService.SaveMessage("user", content, "")
-	cc.conversationService.SaveMessage("assistant", result.Content, result.Emotion)
-
-	if len(result.MemoryUpdate) > 0 {
-		for _, mu := range result.MemoryUpdate {
-			cc.memoryService.AddMemory(mu.Type, mu.Content, mu.Source, mu.Confidence)
-		}
+	if conv != nil {
+		conv.SaveMessage("user", content, "")
+		conv.SaveMessage("assistant", procResult.Content, "")
 	}
 
-	return result.Content, result.Emotion, nil
+	return procResult.Content, "专业", nil
 }
 
 func (cc *CompanionCore) ProcessMessageStream(
 	content string,
 	onChunk func(chunk ai.StreamChunk),
 ) (string, string, error) {
+	// 关键修复：不持长锁读 conversationService。
+	// 之前 defer cc.mu.RUnlock() 让 GetOrCreateTodayConversation 期间
+	// 持读锁，与 OnChange("api_provider") 写锁形成潜在死锁路径。
 	cc.mu.RLock()
-	convID, err := cc.conversationService.GetOrCreateTodayConversation()
+	conv := cc.conversationService
 	cc.mu.RUnlock()
+	if conv == nil {
+		return "", "专业", fmt.Errorf("对话服务未初始化")
+	}
+	convID, err := conv.GetOrCreateTodayConversation()
 	if err != nil {
 		return "", "专业", err
 	}
@@ -519,31 +644,53 @@ func (cc *CompanionCore) GetFileGenerationAgent() *agents.FileGenerationAgent {
 func (cc *CompanionCore) GenerateProactiveContent() ([]models.Observation, error) {
 	var observations []models.Observation
 
+	// 关键修复：conversationService / memoryService 可能因 asyncInit 失败
+	// 而为 nil。直接调用会 panic，让前端 GetProactiveContent 接口直接崩溃。
+	// 这里改为快照读取并做 nil 检查；任一缺失时返回一个兜底问候观察。
+	cc.mu.RLock()
+	conv := cc.conversationService
+	memSvc := cc.memoryService
+	cc.mu.RUnlock()
+
 	today := time.Now().Format("2006-01-02")
-	msgs, _ := cc.conversationService.GetRecentMessages(50)
 	todayProactive := 0
 	weekProactive := 0
 	now := time.Now()
 	weekAgo := now.AddDate(0, 0, -7)
 
-	for _, m := range msgs {
-		if m.Role == "assistant" {
-			msgTime, _ := time.Parse(time.RFC3339, m.Timestamp)
-			if msgTime.Format("2006-01-02") == today {
-				if strings.HasPrefix(m.Content, "【提醒】") || strings.HasPrefix(m.Content, "【观察】") {
-					todayProactive++
+	if conv != nil {
+		msgs, _ := conv.GetRecentMessages(50)
+		for _, m := range msgs {
+			if m.Role == "assistant" {
+				// 历史库使用 SQLite datetime('now')（"2006-01-02 15:04:05"），
+				// 不能用 RFC3339 解析，否则时间永远为零值、计数永远为 0。
+				msgTime := parseMessageTimestamp(m.Timestamp)
+				if msgTime.IsZero() {
+					continue
 				}
-			}
-			if msgTime.After(weekAgo) {
-				if strings.HasPrefix(m.Content, "【提醒】") || strings.HasPrefix(m.Content, "【观察】") {
-					weekProactive++
+				if msgTime.Format("2006-01-02") == today {
+					if strings.HasPrefix(m.Content, "【提醒】") || strings.HasPrefix(m.Content, "【观察】") {
+						todayProactive++
+					}
+				}
+				if msgTime.After(weekAgo) {
+					if strings.HasPrefix(m.Content, "【提醒】") || strings.HasPrefix(m.Content, "【观察】") {
+						weekProactive++
+					}
 				}
 			}
 		}
 	}
 
-	mems, err := cc.memoryService.GetMemories("fact")
-	if err == nil && len(mems) > 0 && todayProactive < 1 && weekProactive < 3 {
+	var mems []models.Memory
+	if memSvc != nil {
+		var err error
+		mems, err = memSvc.GetMemories("fact")
+		if err != nil {
+			mems = nil
+		}
+	}
+	if len(mems) > 0 && todayProactive < 1 && weekProactive < 3 {
 		for _, m := range mems {
 			if strings.Contains(m.Content, "生日") || strings.Contains(m.Content, "纪念日") {
 				observations = append(observations, models.Observation{

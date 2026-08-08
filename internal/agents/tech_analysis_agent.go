@@ -11,6 +11,12 @@ type TechAnalysisAgent struct {
 	webAgent *WebAgent
 }
 
+func (ta *TechAnalysisAgent) Capabilities() []Capability {
+	return []Capability{
+		{Name: "tech_analysis", Description: "AI技术概念深入分析(LLM/Agentic/RAG/Transformer等)", InputDesc: "技术概念名称", OutputDesc: "结构化技术分析"},
+	}
+}
+
 func NewTechAnalysisAgent(aiClient *ai.Client, webAgent *WebAgent) *TechAnalysisAgent {
 	return &TechAnalysisAgent{
 		BaseAgent: BaseAgent{
