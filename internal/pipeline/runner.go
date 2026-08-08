@@ -37,6 +37,8 @@ type ProgressEvent struct {
 // Run 按顺序执行计划中的所有步骤
 // vars: 初始变量（可为 nil）
 // callback: 进度回调（可为 nil）
+// 执行控制：默认按 steps 数组顺序执行；当某步设置了 NextOnSuccess / NextOnFailure
+// 且下标合法时，改为按其指定的 step_index 跳转，支持条件分支工作流。
 func (r *Runner) Run(ctx context.Context, plan Plan, vars map[string]string, callback ProgressCallback) *Result {
 	startTime := time.Now()
 
@@ -49,7 +51,14 @@ func (r *Runner) Run(ctx context.Context, plan Plan, vars map[string]string, cal
 		Variables: vars,
 	}
 
-	for i, step := range plan.Steps {
+	// 记录已访问过的 step_index 用于环路检测（防止 NextOnSuccess
+	// 形成自环导致无限循环；命中后立即终止并标记为失败）。
+	visited := make(map[int]int)
+	const maxLoopGuard = 1024
+	stepLoops := 0
+
+	i := 0
+	for i < len(plan.Steps) {
 		select {
 		case <-ctx.Done():
 			result.Success = false
@@ -59,7 +68,25 @@ func (r *Runner) Run(ctx context.Context, plan Plan, vars map[string]string, cal
 		default:
 		}
 
+		stepLoops++
+		if stepLoops > maxLoopGuard {
+			result.Success = false
+			result.Error = fmt.Sprintf("工作流执行超过最大步数 (%d)，疑似循环", maxLoopGuard)
+			result.Duration = time.Since(startTime).Milliseconds()
+			return result
+		}
+
+		step := plan.Steps[i]
 		stepStart := time.Now()
+
+		// 环路检测
+		if visited[i] >= 3 {
+			result.Success = false
+			result.Error = fmt.Sprintf("检测到步骤 %d 多次执行（已访问 %d 次），停止以避免死循环", i, visited[i])
+			result.Duration = time.Since(startTime).Milliseconds()
+			return result
+		}
+		visited[i]++
 
 		// 条件检查
 		if step.Condition != "" {
@@ -77,6 +104,8 @@ func (r *Runner) Run(ctx context.Context, plan Plan, vars map[string]string, cal
 					Success:   true,
 					Content:   "(skipped)",
 				})
+				// 条件不满足仍按线性顺序继续
+				i++
 				continue
 			}
 		}
@@ -103,12 +132,26 @@ func (r *Runner) Run(ctx context.Context, plan Plan, vars map[string]string, cal
 				Duration:  time.Since(stepStart).Milliseconds(),
 			}
 			result.Steps = append(result.Steps, sr)
+			r.emit(callback, ProgressEvent{
+				Type:      "error",
+				StepIndex: i,
+				StepName:  step.AgentName,
+				Content:   sr.Error,
+				Done:      false,
+				Duration:  sr.Duration,
+			})
+			// 失败时尝试跳到 NextOnFailure，否则按 OnError 决策
+			if next := r.nextIndex(plan, i, false); next != i+1 {
+				i = next
+				continue
+			}
 			if step.OnError != "skip" {
 				result.Success = false
 				result.Error = sr.Error
 				result.Duration = time.Since(startTime).Milliseconds()
 				return result
 			}
+			i++
 			continue
 		}
 
@@ -138,12 +181,17 @@ func (r *Runner) Run(ctx context.Context, plan Plan, vars map[string]string, cal
 				Done:      false,
 				Duration:  duration,
 			})
+			if next := r.nextIndex(plan, i, false); next != i+1 {
+				i = next
+				continue
+			}
 			if step.OnError != "skip" {
 				result.Success = false
 				result.Error = sr.Error
 				result.Duration = time.Since(startTime).Milliseconds()
 				return result
 			}
+			i++
 			continue
 		}
 
@@ -172,6 +220,9 @@ func (r *Runner) Run(ctx context.Context, plan Plan, vars map[string]string, cal
 			Done:      false,
 			Duration:  duration,
 		})
+
+		// 成功跳转到 NextOnSuccess，否则按数组顺序继续
+		i = r.nextIndex(plan, i, true)
 	}
 
 	result.Success = true
@@ -184,6 +235,26 @@ func (r *Runner) Run(ctx context.Context, plan Plan, vars map[string]string, cal
 	})
 
 	return result
+}
+
+// nextIndex 计算下一跳的下标。
+// success=true → 用 NextOnSuccess；否则 NextOnFailure。
+// 字段值 <=0 或越界 → 退化为 "i+1"（线性继续）；
+// 故意把 "0 当无效" 与 step 数组下标冲突 0 区分开
+// （用 1-based 配置成本高、用户体验差，故约定 0/负数 = 走默认）。
+func (r *Runner) nextIndex(plan Plan, i int, success bool) int {
+	if i < 0 || i >= len(plan.Steps) {
+		return i + 1
+	}
+	step := plan.Steps[i]
+	target := step.NextOnSuccess
+	if !success {
+		target = step.NextOnFailure
+	}
+	if target <= 0 || target >= len(plan.Steps) {
+		return i + 1
+	}
+	return target
 }
 
 // RunWithStream 流式执行计划（支持 LLM 流式输出）
