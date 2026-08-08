@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -73,13 +74,51 @@ type ChatResponse struct {
 
 // Client AI API 客户端
 // 支持多个 provider，遵循 OpenAI 兼容的 Chat Completions 接口
+// 注意：apiKey / provider / baseURL / model 等字段会在"用户切换设置"
+// 与"流式对话请求"两条 goroutine 间并发读写，必须用 mu 保护。
 type Client struct {
+	mu          sync.RWMutex
 	apiKey      string
 	provider    string
 	providerCfg Provider
 	baseURL     string
 	model       string
 	httpClient  *http.Client
+}
+
+// snapshot 原子读取所有可变字段（返回结构体副本，调用方按需取用）
+func (c *Client) snapshot() (apiKey, provider, baseURL, model string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.apiKey, c.provider, c.baseURL, c.model
+}
+
+// SetAPIKey 更新 API Key
+func (c *Client) SetAPIKey(apiKey string) {
+	c.mu.Lock()
+	c.apiKey = apiKey
+	c.mu.Unlock()
+}
+
+// SetProvider 切换 provider
+func (c *Client) SetProvider(provider string) {
+	cfg, ok := Providers[provider]
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	c.provider = provider
+	c.providerCfg = cfg
+	c.baseURL = cfg.BaseURL
+	c.model = cfg.Model
+	c.mu.Unlock()
+}
+
+// GetProvider 获取当前 provider 名称
+func (c *Client) GetProvider() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.provider
 }
 
 // NewClient 创建 AI 客户端
@@ -90,6 +129,9 @@ func NewClient(provider, apiKey string) *Client {
 		cfg = Providers["deepseek"]
 		provider = "deepseek"
 	}
+	// 超时：同步 Chat 保留 60s 上限（响应已整体到达，长生成本就不走这里）；
+	// 流式 ChatStream 用更长（5 分钟）超时——只覆盖"建立连接 + 收到首字节"，
+	// 持续读取过程由 SSE 协议自身的 ReadDeadline 守护，避免长生成被掐断。
 	return &Client{
 		apiKey:      apiKey,
 		provider:    provider,
@@ -97,31 +139,9 @@ func NewClient(provider, apiKey string) *Client {
 		baseURL:     cfg.BaseURL,
 		model:       cfg.Model,
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: 5 * time.Minute,
 		},
 	}
-}
-
-// SetAPIKey 更新 API Key
-func (c *Client) SetAPIKey(apiKey string) {
-	c.apiKey = apiKey
-}
-
-// SetProvider 切换 provider
-func (c *Client) SetProvider(provider string) {
-	cfg, ok := Providers[provider]
-	if !ok {
-		return
-	}
-	c.provider = provider
-	c.providerCfg = cfg
-	c.baseURL = cfg.BaseURL
-	c.model = cfg.Model
-}
-
-// GetProvider 获取当前 provider 名称
-func (c *Client) GetProvider() string {
-	return c.provider
 }
 
 // Close 关闭客户端
@@ -133,12 +153,14 @@ func (c *Client) Close() {
 
 // Chat 发送聊天请求
 func (c *Client) Chat(messages []Message, opts ...func(*ChatRequest)) (string, error) {
-	if c.apiKey == "" {
+	// 原子读取所有可变字段，避免与 SetAPIKey/SetProvider 并发读写。
+	apiKey, _, baseURL, model := c.snapshot()
+	if apiKey == "" {
 		return "", fmt.Errorf("API Key 未配置")
 	}
 
 	req := ChatRequest{
-		Model:       c.model,
+		Model:       model,
 		Messages:    messages,
 		Temperature: 0.8,
 		MaxTokens:   2048,
@@ -153,14 +175,14 @@ func (c *Client) Chat(messages []Message, opts ...func(*ChatRequest)) (string, e
 		return "", fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	url := strings.TrimRight(c.baseURL, "/") + "/chat/completions"
+	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return "", fmt.Errorf("创建请求失败: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -214,12 +236,14 @@ type StreamChunk struct {
 // ChatStream 发送流式聊天请求（SSE）
 // onChunk 每收到一个片段就调用，用于实时推送
 func (c *Client) ChatStream(messages []Message, onChunk func(StreamChunk), opts ...func(*ChatRequest)) error {
-	if c.apiKey == "" {
+	// 原子读取所有可变字段，避免与 SetAPIKey/SetProvider 并发读写。
+	apiKey, _, baseURL, model := c.snapshot()
+	if apiKey == "" {
 		return fmt.Errorf("API Key 未配置")
 	}
 
 	req := ChatRequest{
-		Model:       c.model,
+		Model:       model,
 		Messages:    messages,
 		Temperature: 0.8,
 		MaxTokens:   2048,
@@ -235,14 +259,14 @@ func (c *Client) ChatStream(messages []Message, onChunk func(StreamChunk), opts 
 		return fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	url := strings.TrimRight(c.baseURL, "/") + "/chat/completions"
+	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return fmt.Errorf("创建请求失败: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	httpReq.Header.Set("Accept", "text/event-stream")
 
 	resp, err := c.httpClient.Do(httpReq)
