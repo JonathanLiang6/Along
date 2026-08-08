@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"ai-companion/internal/agents"
@@ -15,12 +16,13 @@ import (
 // Orchestrator 主 Agent 编排器
 // 职责: 接收用户输入 → 理解意图 → 生成计划 → 调度子Agent执行 → 返回结果
 type Orchestrator struct {
-	planner      *Planner
-	keywordRouter *KeywordRouter
-	pipeline     *pipeline.Runner
+	mu              sync.RWMutex
+	planner         *Planner
+	keywordRouter   *KeywordRouter
+	pipeline        *pipeline.Runner
 	contextProvider *ContextProvider
-	aiClient     *ai.Client
-	agentMgr     *agents.AgentManager
+	aiClient        *ai.Client
+	agentMgr        *agents.AgentManager
 }
 
 // New 创建编排器
@@ -53,7 +55,8 @@ func (o *Orchestrator) Process(userInput string) (*ProcessResult, error) {
 	var plan *pipeline.Plan
 	var planSource string
 
-	if o.aiClient != nil {
+	aiClient := o.getAIClient()
+	if aiClient != nil {
 		p, err := o.planner.GeneratePlan(userInput, enrichedCtx)
 		if err != nil {
 			log.Printf("[Orchestrator] LLM 规划失败，回退到关键词路由: %v", err)
@@ -114,7 +117,8 @@ func (o *Orchestrator) ProcessStream(userInput string, callback pipeline.Progres
 	var plan *pipeline.Plan
 	var planSource string
 
-	if o.aiClient != nil {
+	aiClient := o.getAIClient()
+	if aiClient != nil {
 		p, err := o.planner.GeneratePlan(userInput, enrichedCtx)
 		if err != nil {
 			log.Printf("[Orchestrator] LLM 规划失败，回退到关键词路由: %v", err)
@@ -173,17 +177,30 @@ func (o *Orchestrator) ProcessStream(userInput string, callback pipeline.Progres
 func (o *Orchestrator) GenerateWorkflow(description string) (*pipeline.Plan, error) {
 	ctx := o.contextProvider.Enrich(description)
 
-	if o.aiClient == nil {
+	if o.getAIClient() == nil {
 		return nil, fmt.Errorf("AI 客户端未初始化")
 	}
 
 	return o.planner.GeneratePlan(description, ctx)
 }
 
-// UpdateAIClient 更新 AI 客户端
+// UpdateAIClient 更新 AI 客户端（写字段时持写锁）
 func (o *Orchestrator) UpdateAIClient(client *ai.Client) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.aiClient = client
-	o.planner.aiClient = client
+	if o.planner != nil {
+		// 关键修复：通过 setClient 走 Planner 自身的写锁，
+		// 与 GeneratePlan 中的 getClient 读锁配对，消除 race。
+		o.planner.setClient(client)
+	}
+}
+
+// getAIClient 原子读取 aiClient 引用，避免与 UpdateAIClient 写竞争
+func (o *Orchestrator) getAIClient() *ai.Client {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.aiClient
 }
 
 // GetPipeline 获取流水线执行器
