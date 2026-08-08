@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { Calendar, Star, TrendingUp, BookOpen, RotateCcw, Loader2, AlertCircle, Plus, X, Trash2, ChevronDown, ChevronUp } from 'lucide-react'
+import { hasBackend, getApp } from '../utils/backend'
 
 // 格式化后端 time.Time 为 YYYY-MM-DD
 const formatDate = (raw) => {
@@ -13,15 +14,6 @@ const formatDate = (raw) => {
   const m = String(d.getMonth() + 1).padStart(2, '0')
   const day = String(d.getDate()).padStart(2, '0')
   return `${y}-${m}-${day}`
-}
-
-// 判断 window.go 是否可用
-const hasBackend = () => {
-  try {
-    return typeof window !== 'undefined' && window.go && window.go.main && window.go.main && window.go.main.App
-  } catch (e) {
-    return false
-  }
 }
 
 function UsPage() {
@@ -61,7 +53,7 @@ function UsPage() {
     setLoading(true)
     setError(null)
     try {
-      const result = await window.go.main.App.GetHighlights()
+      const result = await getApp().GetHighlights()
       setHighlights(Array.isArray(result) ? result : [])
     } catch (err) {
       console.error('GetHighlights failed:', err)
@@ -76,7 +68,7 @@ function UsPage() {
   const loadMemories = useCallback(async () => {
     if (!hasBackend()) return
     try {
-      const result = await window.go.main.App.GetMemories('')
+      const result = await getApp().GetMemories('')
       setMemories(Array.isArray(result) ? result : [])
     } catch (err) {
       console.error('GetMemories failed:', err)
@@ -90,7 +82,7 @@ function UsPage() {
   const loadReflections = useCallback(async () => {
     if (!hasBackend()) return
     try {
-      const result = await window.go.main.App.GetReflections()
+      const result = await getApp().GetReflections()
       setReflections(Array.isArray(result) ? result : [])
     } catch (err) {
       console.error('GetReflections failed:', err)
@@ -118,7 +110,7 @@ function UsPage() {
     setAddLoading(true)
     setAddError(null)
     try {
-      await window.go.main.App.AddHighlight(
+      await getApp().AddHighlight(
         newHighlight.title.trim(),
         newHighlight.description.trim(),
         newHighlight.date || formatDate(new Date().toISOString())
@@ -146,7 +138,7 @@ function UsPage() {
     setReflectionError(null)
     setReflection(null)
     try {
-      const result = await window.go.main.App.GenerateReflection(reflectionPeriod)
+      const result = await getApp().GenerateReflection(reflectionPeriod)
       setReflection(result || null)
       // 复盘后刷新历史列表
       loadReflections()
@@ -163,7 +155,7 @@ function UsPage() {
     if (!confirm('确定要删除这条回忆吗？')) return
     setDeleteLoadingId(id)
     try {
-      await window.go.main.App.DeleteHighlight(id)
+      await getApp().DeleteHighlight(id)
       await loadHighlights()
     } catch (err) {
       console.error('DeleteHighlight failed:', err)

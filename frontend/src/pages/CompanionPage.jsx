@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Menu, ChevronLeft, Sparkles, ChevronDown, AlertCircle, X } from 'lucide-react'
 import { useChat, STREAMING_MSG_ID } from '../hooks/useChat'
+import { hasBackend, getApp } from '../utils/backend'
 import ChatSidebar from '../components/chat/ChatSidebar'
 import MessageBubble from '../components/chat/MessageBubble'
 import ChatInput from '../components/chat/ChatInput'
@@ -8,6 +9,9 @@ import WelcomeScreen from '../components/chat/WelcomeScreen'
 
 // 距底部多少像素内算“在底部”，超过则不自动滚（避免打断阅读）
 const NEAR_BOTTOM_THRESHOLD = 80
+
+// 全局事件名：自动化页面增/删/改任务后 dispatch，CompanionPage 监听后刷新指令菜单
+export const SLASH_COMMANDS_CHANGED_EVENT = 'along:slash-commands-changed'
 
 export default function CompanionPage() {
   const chat = useChat()
@@ -32,9 +36,47 @@ export default function CompanionPage() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [showCommands, setShowCommands] = useState(false)
   const [isAtBottom, setIsAtBottom] = useState(true)
+  const [commands, setCommands] = useState([])
 
   const scrollRef = useRef(null)
   const bottomRef = useRef(null)
+
+  // 加载所有可用斜杠命令（默认 + 用户自定义）
+  // 当自动化任务被增/删/改/启停时，AutomationPage 会派发
+  // SLASH_COMMANDS_CHANGED_EVENT 事件触发此处重新拉取，做到"实时同步"。
+  const loadSlashCommands = useCallback(async () => {
+    if (!hasBackend()) {
+      setCommands([])
+      return
+    }
+    try {
+      const result = await getApp().GetAvailableSlashCommands()
+      setCommands(Array.isArray(result) ? result : [])
+    } catch (err) {
+      console.error('加载斜杠指令列表失败:', err)
+      setCommands([])
+    }
+  }, [])
+
+  useEffect(() => {
+    loadSlashCommands()
+  }, [loadSlashCommands])
+
+  // 监听自动化任务的实时变化事件
+  useEffect(() => {
+    const handler = () => loadSlashCommands()
+    window.addEventListener(SLASH_COMMANDS_CHANGED_EVENT, handler)
+    return () => window.removeEventListener(SLASH_COMMANDS_CHANGED_EVENT, handler)
+  }, [loadSlashCommands])
+
+  // 页面重新可见时也刷新一次（兜底：错过事件时仍能更新）
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') loadSlashCommands()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [loadSlashCommands])
 
   // 展示用消息列表：流式中追加一条临时流式消息
   const displayMessages = useMemo(() => {
@@ -196,6 +238,7 @@ export default function CompanionPage() {
             showCommands={showCommands}
             setShowCommands={setShowCommands}
             onCommandSelect={handleCommandSelect}
+            commands={commands}
           />
         </div>
       </div>

@@ -17,14 +17,7 @@ import {
   ChevronRight,
   PlusCircle,
 } from 'lucide-react'
-
-const hasBackend = () => {
-  try {
-    return typeof window !== 'undefined' && window.go && window.go.main && window.go.main.App
-  } catch (e) {
-    return false
-  }
-}
+import { hasBackend, getApp } from '../utils/backend'
 
 const PLAN_TYPES = [
   { id: 'learning', label: '学习', icon: BookOpen, color: 'text-primary-400', bg: 'bg-primary-500/10' },
@@ -320,8 +313,8 @@ function PlanDetail({ goal, onBack, onUpdate, onDelete }) {
     if (!hasBackend()) return
     try {
       const [ms, ci] = await Promise.all([
-        window.go.main.App.GetMilestones(goal.id),
-        window.go.main.App.GetCheckIns(goal.id),
+        getApp().GetMilestones(goal.id),
+        getApp().GetCheckIns(goal.id),
       ])
       setMilestones(Array.isArray(ms) ? ms : [])
       setCheckIns(Array.isArray(ci) ? ci : [])
@@ -337,7 +330,7 @@ function PlanDetail({ goal, onBack, onUpdate, onDelete }) {
   const handleAddMilestone = async () => {
     if (!newMilestone.trim() || !hasBackend()) return
     try {
-      await window.go.main.App.AddMilestone(goal.id, newMilestone.trim(), '')
+      await getApp().AddMilestone(goal.id, newMilestone.trim(), '')
       setNewMilestone('')
       loadData()
     } catch (e) {
@@ -348,7 +341,7 @@ function PlanDetail({ goal, onBack, onUpdate, onDelete }) {
   const handleCompleteMilestone = async (id) => {
     if (!hasBackend()) return
     try {
-      await window.go.main.App.CompleteMilestone(id, '做得好！又前进了一步。')
+      await getApp().CompleteMilestone(id, '做得好！又前进了一步。')
       loadData()
       if (onUpdate) onUpdate()
     } catch (e) {
@@ -360,7 +353,7 @@ function PlanDetail({ goal, onBack, onUpdate, onDelete }) {
     if (!hasBackend()) return
     if (!confirm('确定删除这个里程碑吗？')) return
     try {
-      await window.go.main.App.DeleteMilestone(id)
+      await getApp().DeleteMilestone(id)
       loadData()
     } catch (e) {
       console.error('删除失败:', e)
@@ -370,7 +363,7 @@ function PlanDetail({ goal, onBack, onUpdate, onDelete }) {
   const handleAddCheckIn = async () => {
     if (!newCheckIn.trim() || !hasBackend()) return
     try {
-      await window.go.main.App.AddCheckIn(goal.id, newCheckIn.trim(), '', '记录下来了，继续加油。')
+      await getApp().AddCheckIn(goal.id, newCheckIn.trim(), '', '记录下来了，继续加油。')
       setNewCheckIn('')
       loadData()
     } catch (e) {
@@ -382,7 +375,7 @@ function PlanDetail({ goal, onBack, onUpdate, onDelete }) {
     if (!hasBackend()) return
     if (!confirm('确定删除这条记录吗？')) return
     try {
-      await window.go.main.App.DeleteCheckIn(id)
+      await getApp().DeleteCheckIn(id)
       loadData()
     } catch (e) {
       console.error('删除失败:', e)
@@ -392,7 +385,7 @@ function PlanDetail({ goal, onBack, onUpdate, onDelete }) {
   const handleSaveEdit = async () => {
     if (!hasBackend() || !editTitle.trim()) return
     try {
-      await window.go.main.App.UpdateGoal(
+      await getApp().UpdateGoal(
         goal.id,
         editTitle.trim(),
         editDesc.trim(),
@@ -413,7 +406,7 @@ function PlanDetail({ goal, onBack, onUpdate, onDelete }) {
     if (!hasBackend()) return
     if (!confirm('确定删除这个计划吗？所有里程碑和记录都会被删除。')) return
     try {
-      await window.go.main.App.DeleteGoal(goal.id)
+      await getApp().DeleteGoal(goal.id)
       if (onDelete) onDelete(goal.id)
       onBack()
     } catch (e) {
@@ -728,8 +721,8 @@ function PlanPage() {
     setLoading(true)
     try {
       const data = filterType === 'all'
-        ? await window.go.main.App.GetGoals()
-        : await window.go.main.App.GetGoalsByType(filterType)
+        ? await getApp().GetGoals()
+        : await getApp().GetGoalsByType(filterType)
       setGoals(Array.isArray(data) ? data : [])
     } catch (e) {
       console.error('加载计划失败:', e)
@@ -745,7 +738,7 @@ function PlanPage() {
       return
     }
     try {
-      const tasks = await window.go.main.App.GetAutomationTasks('habit_checkin')
+      const tasks = await getApp().GetAutomationTasks('habit_checkin')
       setCheckinTasks(Array.isArray(tasks) ? tasks : [])
     } catch (e) {
       console.error('加载打卡任务失败:', e)
@@ -761,7 +754,7 @@ function PlanPage() {
   const handleCreate = async (title, description, type) => {
     if (!hasBackend()) return
     try {
-      await window.go.main.App.CreateGoal(title, description, type)
+      await getApp().CreateGoal(title, description, type)
       loadGoals()
     } catch (e) {
       console.error('创建失败:', e)
@@ -873,7 +866,7 @@ function PlanPage() {
                   <div
                     key={task.id}
                     className="bg-surface/60 border border-border/80 rounded-xl p-4 hover:border-primary-500/40 transition-all cursor-pointer"
-                    onClick={() => window.go.main.App.RunAutomationTaskNow(task.id)}
+                    onClick={() => getApp().RunAutomationTaskNow(task.id)}
                   >
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
@@ -896,7 +889,7 @@ function PlanPage() {
                       <button
                         onClick={(e) => {
                           e.stopPropagation()
-                          window.go.main.App.RunAutomationTaskNow(task.id)
+                          getApp().RunAutomationTaskNow(task.id)
                         }}
                         className="px-3 py-1.5 bg-primary-600/10 hover:bg-primary-600/20 text-primary-400 text-xs font-medium rounded-lg transition-colors"
                       >
