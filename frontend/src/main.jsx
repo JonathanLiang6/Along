@@ -1,84 +1,15 @@
-import React, { useState, useEffect } from 'react'
+import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
 
+// 【黑屏问题修复】不再因为 window.go 没就绪就阻塞渲染。
+// 旧逻辑：JS 启动 → 等 window.go.main.App → 10秒后超时才显示错误。
+//       一旦 OnStartup 卡住，前端永远停在"正在加载…"，看起来就是黑屏。
+// 新逻辑：JS 启动 → 立刻渲染 App → App 内部按需等待 Go 后端。
+//       即使 Go 后端长时间未就绪，UI 主框架也会立刻可见，
+//       让用户至少看到"Along 启动中"提示。
 function RootApp() {
-  const [goReady, setGoReady] = useState(false)
-  const [loadFailed, setLoadFailed] = useState(false)
-  const [retryKey, setRetryKey] = useState(0)
-
-  useEffect(() => {
-    let attempts = 0
-    const maxAttempts = 100
-    let timer = null
-    const checkGo = () => {
-      if (window.go && window.go.main && window.go.main.App) {
-        setGoReady(true)
-        setLoadFailed(false)
-      } else if (attempts < maxAttempts) {
-        attempts++
-        timer = setTimeout(checkGo, 100)
-      } else {
-        setGoReady(false)
-        setLoadFailed(true)
-      }
-    }
-    checkGo()
-    return () => {
-      if (timer) clearTimeout(timer)
-    }
-  }, [retryKey])
-
-  const handleRetry = () => {
-    setLoadFailed(false)
-    setRetryKey(k => k + 1)
-  }
-
-  if (!goReady) {
-    return (
-      <div style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        height: '100vh',
-        backgroundColor: '#1c1c1e',
-        color: '#fff',
-        fontFamily: 'system-ui, sans-serif'
-      }}>
-        <div style={{ textAlign: 'center', maxWidth: '400px', padding: '20px' }}>
-          {loadFailed ? (
-            <>
-              <div style={{ fontSize: '24px', marginBottom: '12px', color: '#ff453a' }}>加载失败</div>
-              <div style={{ fontSize: '14px', color: '#888', marginBottom: '20px' }}>
-                后端服务未能正常启动。请尝试重新加载，如果问题持续存在，请检查应用日志。
-              </div>
-              <button
-                onClick={handleRetry}
-                style={{
-                  padding: '10px 24px',
-                  fontSize: '14px',
-                  backgroundColor: '#0a84ff',
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: '8px',
-                  cursor: 'pointer'
-                }}
-              >
-                重新加载
-              </button>
-            </>
-          ) : (
-            <>
-              <div style={{ fontSize: '24px', marginBottom: '12px' }}>正在加载…</div>
-              <div style={{ fontSize: '14px', color: '#888' }}>Along</div>
-            </>
-          )}
-        </div>
-      </div>
-    )
-  }
-
   return (
     <React.StrictMode>
       <App />
@@ -86,4 +17,22 @@ function RootApp() {
   )
 }
 
+console.log('[boot] main.jsx loaded, mounting React')
+
 ReactDOM.createRoot(document.getElementById('root')).render(<RootApp />)
+
+// 【黑屏修复】React 一旦挂载，立刻摘掉 index.html 里的静态 boot-splash。
+// 关键：必须使用 remove() 而不是 display:none，否则 boot-splash
+// 仍然以 z-index:9999 浮在所有 React 内容之上、把后端"启动中"提示
+// 完全盖住——这就是用户看到的"卡在黑屏"的真正原因之一。
+// 这里同步在挂载后立即调用，不依赖任何 setTimeout 兜底。
+try {
+  const splash = document.getElementById('boot-splash')
+  if (splash && splash.parentNode) {
+    splash.parentNode.removeChild(splash)
+    console.log('[boot] boot-splash removed by React mount')
+  }
+} catch (e) {
+  console.warn('[boot] failed to remove boot-splash:', e)
+}
+
