@@ -12,13 +12,55 @@ import (
 )
 
 // ToolAgent 工具操作 Agent
+// 安全注意：所有文件/目录操作必须在 allowRoots 范围内进行，
+// 防止 LLM 提示注入或自动化任务读取/覆盖用户机器任意文件。
 type ToolAgent struct {
-	aiClient *ai.Client
+	aiClient   *ai.Client
+	allowRoots []string // 允许操作的根目录（绝对路径），由 SetAllowRoots 注入
 }
 
 // NewToolAgent 创建工具 Agent
 func NewToolAgent(client *ai.Client) *ToolAgent {
 	return &ToolAgent{aiClient: client}
+}
+
+// SetAllowRoots 设置允许操作的根目录白名单
+// 绝对路径会做 filepath.Clean 规范化，便于后续 contains 判断。
+// 注入时通常传入：当前用户主目录、当前工作目录、应用数据目录。
+func (ta *ToolAgent) SetAllowRoots(roots []string) {
+	cleaned := make([]string, 0, len(roots))
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		abs, err := filepath.Abs(r)
+		if err != nil {
+			continue
+		}
+		cleaned = append(cleaned, filepath.Clean(abs))
+	}
+	ta.allowRoots = cleaned
+}
+
+// isPathAllowed 检查绝对路径是否落在白名单任意根目录下
+func (ta *ToolAgent) isPathAllowed(absPath string) bool {
+	if len(ta.allowRoots) == 0 {
+		// 未配置白名单时拒绝所有文件操作（默认安全策略）
+		return false
+	}
+	cleaned := filepath.Clean(absPath)
+	for _, root := range ta.allowRoots {
+		// filepath.Rel 在路径不在 root 下时返回 "../..." 形式，
+		// 通过判断是否以 ".." 开头判断越界。
+		rel, err := filepath.Rel(root, cleaned)
+		if err != nil {
+			continue
+		}
+		if !strings.HasPrefix(rel, "..") && rel != ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // ToolRequest 工具请求
@@ -131,6 +173,11 @@ func (ta *ToolAgent) ReadFile(path string) ToolResponse {
 	// 转换路径
 	path = ta.normalizePath(path)
 
+	// 沙箱：必须落在白名单目录内
+	if !ta.isPathAllowed(path) {
+		return ToolResponse{Success: false, Error: "路径不在允许的操作范围内"}
+	}
+
 	// 检查文件是否存在
 	info, err := os.Stat(path)
 	if err != nil {
@@ -139,6 +186,12 @@ func (ta *ToolAgent) ReadFile(path string) ToolResponse {
 
 	if info.IsDir() {
 		return ToolResponse{Success: false, Error: "指定路径是目录，不是文件"}
+	}
+
+	// 限制单文件最大读取大小（5MB），防止撑爆内存
+	const maxReadBytes = 5 * 1024 * 1024
+	if info.Size() > maxReadBytes {
+		return ToolResponse{Success: false, Error: fmt.Sprintf("文件过大 (%.1fMB > 5MB)，拒绝读取", float64(info.Size())/1024/1024)}
 	}
 
 	// 读取文件内容
@@ -165,6 +218,17 @@ func (ta *ToolAgent) WriteFile(path, content string) ToolResponse {
 
 	// 转换路径
 	path = ta.normalizePath(path)
+
+	// 沙箱：必须落在白名单目录内
+	if !ta.isPathAllowed(path) {
+		return ToolResponse{Success: false, Error: "路径不在允许的操作范围内"}
+	}
+
+	// 限制单次写入大小（10MB）
+	const maxWriteBytes = 10 * 1024 * 1024
+	if len(content) > maxWriteBytes {
+		return ToolResponse{Success: false, Error: fmt.Sprintf("内容过大 (%dB > 10MB)，拒绝写入", len(content))}
+	}
 
 	// 确保目录存在
 	dir := filepath.Dir(path)
@@ -195,6 +259,11 @@ func (ta *ToolAgent) ListDir(path string) ToolResponse {
 
 	// 转换路径
 	path = ta.normalizePath(path)
+
+	// 沙箱：必须落在白名单目录内
+	if !ta.isPathAllowed(path) {
+		return ToolResponse{Success: false, Error: "路径不在允许的操作范围内"}
+	}
 
 	// 检查目录是否存在
 	info, err := os.Stat(path)
@@ -246,6 +315,11 @@ func (ta *ToolAgent) GitStatus(repoPath string) ToolResponse {
 	}
 
 	repoPath = ta.normalizePath(repoPath)
+
+	// 沙箱：必须落在白名单目录内
+	if !ta.isPathAllowed(repoPath) {
+		return ToolResponse{Success: false, Error: "路径不在允许的操作范围内"}
+	}
 
 	// 检查是否是git仓库
 	gitDir := filepath.Join(repoPath, ".git")
@@ -303,6 +377,11 @@ func (ta *ToolAgent) GitLog(repoPath string, limit int) ToolResponse {
 	}
 
 	repoPath = ta.normalizePath(repoPath)
+
+	// 沙箱：必须落在白名单目录内
+	if !ta.isPathAllowed(repoPath) {
+		return ToolResponse{Success: false, Error: "路径不在允许的操作范围内"}
+	}
 
 	// 检查是否是git仓库
 	gitDir := filepath.Join(repoPath, ".git")
