@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ai-companion/internal/agents"
@@ -16,6 +18,7 @@ import (
 	"ai-companion/internal/core"
 	"ai-companion/internal/db"
 	"ai-companion/internal/models"
+	"ai-companion/internal/pipeline"
 	"ai-companion/internal/scheduler"
 	"ai-companion/internal/services"
 
@@ -24,147 +27,373 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// initPhase 表示后端初始化阶段。
+// 阶段从 0 开始单调递增，前端通过 GetInitPhase() 轮询以更新启动提示文案。
+const (
+	phaseBooting      int32 = 0 // OnStartup 刚被调用，尚未开始
+	phaseDataDir      int32 = 1 // 数据目录
+	phaseDatabase     int32 = 2 // 数据库连接 + 建表 + 迁移
+	phaseServices     int32 = 3 // 设置/记忆/对话/计划/自动化服务
+	phaseAI           int32 = 4 // AI 客户端 + 默认设置
+	phaseCompanion    int32 = 5 // CompanionCore + 工具 Agent 白名单
+	phaseScheduler    int32 = 6 // 调度器（异步后台）
+	phaseTray         int32 = 7 // 系统托盘（异步后台）
+	phaseReady        int32 = 9 // 完全就绪
+)
+
+// phaseLabel 给前端展示用的中文文案
+var phaseLabel = map[int32]string{
+	phaseBooting:   "正在启动…",
+	phaseDataDir:   "准备数据目录…",
+	phaseDatabase:  "初始化数据库…",
+	phaseServices:  "加载服务模块…",
+	phaseAI:        "配置 AI 客户端…",
+	phaseCompanion: "构建智能体…",
+	phaseScheduler: "启动任务调度…",
+	phaseTray:      "连接系统托盘…",
+	phaseReady:     "准备就绪",
+}
+
 // App 应用主结构
+//
+// 【黑屏修复】字段并发读写说明：
+//   - 启动阶段（OnDomReady 之前）：所有字段只能由 asyncInit goroutine 写入
+//   - 启动完成后：读侧（前端调用）需加锁，写侧（settings hooks 等）需加锁
+//   - a.ready / a.phase 是 atomic.Int32 字段，不需要锁
+//   - a.ctx 是 atomic.Pointer 风格：仅在 OnStartup 中写一次，此后只读
+//   - a.mu 是兜底互斥锁，用于保护"先 nil 检查 → 再使用"的临界区
 type App struct {
-	ctx              context.Context
+	ctx context.Context
+
+	// ready / phase 由 atomic 直接管理，零值即可用
+	ready atomic.Int32 // 0=未就绪，1=就绪
+	phase atomic.Int32 // 当前初始化阶段
+
 	db               *sql.DB
 	aiClient         *ai.Client
 	companionCore    *core.CompanionCore
 	settings         *services.SettingsService
 	memory           *services.MemoryService
 	conversation     *services.ConversationService
-	plan               *services.PlanService
-	automationService  *services.AutomationService
-	scheduler          *scheduler.Scheduler
-	dataDir            string
-	shutdownOnce     sync.Once
-	isShuttingDown   bool
-	mu               sync.Mutex
+	plan             *services.PlanService
+	automationService *services.AutomationService
+	scheduler        *scheduler.Scheduler
+	dataDir          string
+
+	shutdownOnce   sync.Once
+	isShuttingDown bool
+	mu             sync.Mutex
 }
 
-// NewApp 创建新应用实例
-func NewApp() (*App, error) {
-	app := &App{}
+// IsReady 对外暴露：后端是否已完全就绪
+// 前端 App.jsx 轮询该方法，期间显示"Along 正在启动"提示。
+// 即便 window.go 已注入，只要后端初始化没完成，IsReady 也会返回 false。
+func (a *App) IsReady() bool {
+	return a.ready.Load() == 1
+}
 
-	// 初始化数据目录
-	fmt.Println("正在初始化数据目录...")
-	appDataDir, err := app.getDataDir()
-	if err != nil {
-		return nil, fmt.Errorf("无法获取数据目录: %w", err)
+// GetInitPhase 对外暴露：当前初始化阶段
+// 前端可以根据阶段展示更细粒度的提示文案。
+// 返回值为 phaseLabel 中定义的常量。
+func (a *App) GetInitPhase() map[string]interface{} {
+	phase := a.phase.Load()
+	return map[string]interface{}{
+		"phase": phase,
+		"label": phaseLabel[phase],
+		"ready": a.IsReady(),
 	}
-	app.dataDir = appDataDir
-	fmt.Println("数据目录:", app.dataDir)
-
-	// 创建必要的子目录
-	app.ensureDirectories()
-
-	// 初始化数据库
-	fmt.Println("正在初始化数据库...")
-	database, err := db.InitDB(filepath.Join(app.dataDir, "companion.db"))
-	if err != nil {
-		return nil, fmt.Errorf("数据库初始化失败: %w", err)
-	}
-	app.db = database
-	fmt.Println("数据库连接成功")
-
-	// 初始化服务
-	fmt.Println("正在初始化服务...")
-	app.settings = services.NewSettingsService(app.db)
-	if app.settings == nil {
-		return nil, fmt.Errorf("设置服务创建失败")
-	}
-	app.memory = services.NewMemoryService(app.db)
-	app.conversation = services.NewConversationService(app.db)
-	app.conversation.SetConversationsDir(filepath.Join(app.dataDir, "conversations"))
-	app.plan = services.NewPlanService(app.db)
-	app.automationService = services.NewAutomationService(app.db)
-	fmt.Println("服务初始化成功")
-
-	// 初始化默认设置
-	fmt.Println("正在初始化默认设置...")
-	if err := app.settings.InitDefaults(); err != nil {
-		return nil, fmt.Errorf("初始化默认设置失败: %w", err)
-	}
-	fmt.Println("默认设置初始化完成")
-
-	// 初始化系统任务模板（不依赖自动化引擎，确保模板一定存在）
-	fmt.Println("正在初始化任务模板...")
-	app.initTaskTemplates()
-	fmt.Println("任务模板初始化完成")
-
-	// 初始化 AI 客户端（支持多 provider）
-	fmt.Println("正在初始化 AI 客户端...")
-	app.initAIClient()
-	fmt.Println("AI 客户端初始化完成")
-
-	fmt.Println("Along 核心初始化完成")
-	return app, nil
 }
 
 // startup 应用启动时调用
+//
+// 【黑屏问题彻底修复】Wails 文档与社区共识：
+//   - Wails 的 OnStartup 必须在最短时间内返回
+//   - 一旦 OnStartup 阻塞，Wails 主循环就被卡住，WebView2 无法继续渲染
+//   - "打开软件后一直黑屏"几乎都源于 OnStartup / OnDomReady / 启动钩子中
+//     存在长时间阻塞的 I/O、死锁、或与前端通信被同步等待
+//
+// 本函数采取"极简同步段 + 全异步后台段"：
+//   同步段（必须在毫秒级返回，不做任何 I/O、拿锁、阻塞调用）：
+//     1) 保存 ctx（唯一必须）
+//     2) 立即启动 asyncInit goroutine
+//     3) return
+//
+//   异步段（asyncInit，所有重活都在这里执行）：
+//     1) 数据目录 → 数据库 → 服务 → AI 客户端 → CompanionCore（带分阶段超时）
+//     2) 调度器 → 托盘（独立 goroutine，绝不阻塞启动）
+//     3) 标记 ready = 1，并通过 EventsEmit 通知前端
+//
+// OnStartup 的目标执行时间：< 1ms
 func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-
+	enter := time.Now()
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Printf("应用启动时发生 panic: %v\n", r)
+			fmt.Printf("[startup] PANIC: %v (耗时 %v)\n", r, time.Since(enter))
 		}
 	}()
 
-	// 初始化 Companion Core
+	// ============ 极简同步段：仅保存 ctx，立即启动后台初始化 ============
+	a.ctx = ctx
+	fmt.Printf("[startup] enter (will launch asyncInit and return immediately)\n")
+
+	// 把所有可能阻塞的工作放到独立 goroutine
+	go a.asyncInit()
+
+	fmt.Printf("[startup] exit (耗时 %v)\n", time.Since(enter))
+}
+
+// asyncInit 后台异步初始化整个后端
+//
+// 设计原则：
+//   - 严格分阶段（phase），每阶段更新 atomic phase，前端可读
+//   - 关键阻塞操作（DB、Scheduler、注册表）放进带超时的子 goroutine
+//   - 任一阶段 panic 都被 recover 兜住，不影响整体启动
+//   - 全部完成后置 ready=1，并通过 backend:ready 事件推前端
+//
+// 注意：所有"可能阻塞"的代码（DB Ping、Scheduler Start、注册表写入等）
+// 都用 done := make(chan struct{}); go func(){...; close(done)}(); select{...}
+// 模式包一层，确保即便底层卡死也不会让 asyncInit 永远不返回。
+func (a *App) asyncInit() {
+	enter := time.Now()
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[asyncInit] panic: %v (耗时 %v)\n", r, time.Since(enter))
+		}
+		// 即便中间任意阶段 panic，也尝试把 ready 置位，让前端至少能进 UI
+		// （部分功能会因为底层没初始化而调用失败，由各方法自身的 nil 检查兜底）
+		if a.ready.Load() == 0 {
+			a.phase.Store(phaseReady)
+			a.ready.Store(1)
+			if a.ctx != nil {
+				wruntime.EventsEmit(a.ctx, "backend:ready", map[string]interface{}{
+					"time":  time.Now().Format(time.RFC3339),
+					"phase": phaseReady,
+					"label": phaseLabel[phaseReady],
+				})
+			}
+		}
+	}()
+
+	// ============ 阶段 1：数据目录（带 3 秒超时） ============
+	a.phase.Store(phaseDataDir)
+	fmt.Println("[asyncInit] 阶段 1/7: 准备数据目录")
+	if err := a.runWithTimeout(3*time.Second, "dataDir", func() error {
+		dataDir, err := a.getDataDir()
+		if err != nil {
+			return err
+		}
+		a.dataDir = dataDir
+		a.ensureDirectories()
+		return nil
+	}); err != nil {
+		fmt.Printf("[asyncInit] 数据目录阶段失败（已跳过）: %v\n", err)
+	}
+
+	// ============ 阶段 2：数据库（带 10 秒超时） ============
+	a.phase.Store(phaseDatabase)
+	fmt.Println("[asyncInit] 阶段 2/7: 初始化数据库")
+	if a.dataDir != "" {
+		dbPath := filepath.Join(a.dataDir, "companion.db")
+		if err := a.runWithTimeout(10*time.Second, "database", func() error {
+			database, err := db.InitDB(dbPath)
+			if err != nil {
+				return err
+			}
+			a.db = database
+			return nil
+		}); err != nil {
+			fmt.Printf("[asyncInit] 数据库初始化失败（已跳过）: %v\n", err)
+		}
+	}
+
+	// ============ 阶段 3：服务模块（带 3 秒超时） ============
+	a.phase.Store(phaseServices)
+	fmt.Println("[asyncInit] 阶段 3/7: 加载服务模块")
+	if a.db != nil {
+		if err := a.runWithTimeout(3*time.Second, "services", func() error {
+			a.settings = services.NewSettingsService(a.db)
+			if a.settings == nil {
+				return fmt.Errorf("设置服务创建失败")
+			}
+			a.memory = services.NewMemoryService(a.db)
+			a.conversation = services.NewConversationService(a.db)
+			if a.dataDir != "" {
+				a.conversation.SetConversationsDir(filepath.Join(a.dataDir, "conversations"))
+			}
+			a.plan = services.NewPlanService(a.db)
+			a.automationService = services.NewAutomationService(a.db)
+			return nil
+		}); err != nil {
+			fmt.Printf("[asyncInit] 服务模块加载失败（已跳过）: %v\n", err)
+		}
+	}
+
+	// ============ 阶段 4：AI 客户端 + 默认设置（带 3 秒超时） ============
+	a.phase.Store(phaseAI)
+	fmt.Println("[asyncInit] 阶段 4/7: 配置 AI 客户端")
+	if a.settings != nil {
+		if err := a.runWithTimeout(3*time.Second, "ai", func() error {
+			// 默认设置幂等写入（不影响现有值）
+			if err := a.settings.InitDefaults(); err != nil {
+				fmt.Printf("[asyncInit] 默认设置初始化失败: %v\n", err)
+			}
+			a.initAIClient()
+			return nil
+		}); err != nil {
+			fmt.Printf("[asyncInit] AI 阶段失败（已跳过）: %v\n", err)
+		}
+	}
+
+	// ============ 阶段 5：CompanionCore（无 I/O，毫秒级） ============
+	a.phase.Store(phaseCompanion)
+	fmt.Println("[asyncInit] 阶段 5/7: 构建智能体")
 	if a.aiClient != nil && a.memory != nil && a.conversation != nil && a.plan != nil {
 		a.companionCore = core.NewCompanionCore(a.aiClient, a.memory, a.conversation, a.plan)
 
 		// 设置文件生成 Agent 的输出目录
-		if fileAgent := a.companionCore.GetFileGenerationAgent(); fileAgent != nil {
+		if fileAgent := a.companionCore.GetFileGenerationAgent(); fileAgent != nil && a.dataDir != "" {
 			fileAgent.SetOutputDir(filepath.Join(a.dataDir, "research_docs"))
 		}
+
+		// 注入工具 Agent 的文件操作白名单
+		if toolAgent := a.companionCore.GetToolAgent(); toolAgent != nil {
+			roots := []string{}
+			if a.dataDir != "" {
+				roots = append(roots, a.dataDir)
+				roots = append(roots, filepath.Join(a.dataDir, "research_docs"))
+			}
+			if homeDir, err := os.UserHomeDir(); err == nil {
+				roots = append(roots, homeDir)
+			}
+			if cwd, err := os.Getwd(); err == nil {
+				roots = append(roots, cwd)
+			}
+			toolAgent.SetAllowRoots(roots)
+		}
 	}
 
-	// 初始化调度器
+	// 调度器 + 回调（无 I/O）
 	if a.db != nil && a.companionCore != nil {
-		a.scheduler = scheduler.New(a.db, a.dataDir)
-		// 设置 Agent 任务执行回调
-		a.scheduler.OnExecuteAgentTask = func(task *models.AutomationTask) *models.AutomationExecution {
-			return a.executeAutomationTask(task)
+		a.scheduler = scheduler.New(a.db, a.dataDir, a.automationService)
+		a.scheduler.OnExecuteAgentTask = func(execID int, task *models.AutomationTask) *models.AutomationExecution {
+			return a.executeAutomationTask(execID, task)
 		}
-		if err := a.scheduler.Start(); err != nil {
-			fmt.Println("调度器启动失败:", err)
-		}
-
-		// 设置自动化服务到 companionCore（用于斜杠命令调用）
 		a.companionCore.SetAutomationService(a.automationService)
 		a.companionCore.SetTaskExecutor(a)
-
-		// 初始化默认的AI前沿知识调研任务
-		a.initDefaultResearchTask()
 	}
 
-	// 注册设置变更钩子
+	// 设置变更钩子（仅内存写入）
 	a.setupSettingHooks()
 
-	// 同步开机启动设置（仅 Windows）
-	a.syncAutoStart()
-
-	// 启动系统托盘（如果启用）
-	trayEnabled := true
-	if a.settings != nil {
-		trayVal, _ := a.settings.Get("system_tray_enabled")
-		if trayVal == "false" || trayVal == "0" {
-			trayEnabled = false
-		}
-	}
-	if trayEnabled {
-		StartTray(a)
-		// 监听托盘退出信号
+	// ============ 阶段 6：调度器（异步后台，带 15 秒兜底） ============
+	a.phase.Store(phaseScheduler)
+	fmt.Println("[asyncInit] 阶段 6/7: 启动任务调度（异步）")
+	if a.scheduler != nil {
 		go func() {
-			<-WaitForTrayQuit()
-			fmt.Println("托盘请求退出，正在关闭应用...")
-			a.QuitApp()
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("[asyncInit] 调度器 panic: %v\n", r)
+				}
+			}()
+			done := make(chan struct{})
+			go func() {
+				if err := a.scheduler.Start(); err != nil {
+					fmt.Println("调度器启动失败:", err)
+				}
+				close(done)
+			}()
+			select {
+			case <-done:
+				log.Println("调度器启动完成")
+			case <-time.After(15 * time.Second):
+				fmt.Println("[asyncInit] 调度器启动超时（15s），已放弃等待，继续运行")
+			}
 		}()
 	}
 
-	fmt.Println("Along 已启动")
+	// 同步开机启动设置（异步，带 3 秒超时）
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("[asyncInit] 同步开机启动 panic: %v\n", r)
+			}
+		}()
+		done := make(chan struct{})
+		go func() {
+			a.syncAutoStart()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			fmt.Println("[asyncInit] 同步开机启动超时（3s），跳过")
+		}
+	}()
+
+	// ============ 阶段 7：系统托盘（异步后台） ============
+	a.phase.Store(phaseTray)
+	fmt.Println("[asyncInit] 阶段 7/7: 连接系统托盘（异步）")
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("[asyncInit] 托盘启动 panic: %v\n", r)
+			}
+		}()
+		trayEnabled := true
+		if a.settings != nil {
+			trayVal, _ := a.settings.Get("system_tray_enabled")
+			if trayVal == "false" || trayVal == "0" {
+				trayEnabled = false
+			}
+		}
+		if trayEnabled {
+			StartTray(a)
+			// 监听托盘退出信号
+			go func() {
+				<-WaitForTrayQuit()
+				fmt.Println("托盘请求退出，正在关闭应用...")
+				a.QuitApp()
+			}()
+		}
+	}()
+
+	// ============ 就绪：标记 ready=1，通知前端 ============
+	a.phase.Store(phaseReady)
+	a.ready.Store(1)
+	fmt.Printf("[asyncInit] 全部阶段完成，已就绪（总耗时 %v）\n", time.Since(enter))
+
+	if a.ctx != nil {
+		wruntime.EventsEmit(a.ctx, "backend:ready", map[string]interface{}{
+			"time":  time.Now().Format(time.RFC3339),
+			"phase": phaseReady,
+			"label": phaseLabel[phaseReady],
+		})
+	}
+}
+
+// runWithTimeout 在 timeout 时间内执行 fn，超时则放弃并返回 error。
+// 即使 fn panic 也只影响本函数返回，不影响调用方。
+// 关键作用：把任意可能阻塞的 I/O 包成一个有上限的执行单元，
+// 避免 asyncInit 阶段被卡死，导致 phase 永远停在某个数字、
+// 前端 IsReady 永远返回 false 的"假死锁"。
+func (a *App) runWithTimeout(timeout time.Duration, label string, fn func() error) error {
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				runErr = fmt.Errorf("%s panic: %v", label, r)
+			}
+			close(done)
+		}()
+		runErr = fn()
+	}()
+	select {
+	case <-done:
+		return runErr
+	case <-time.After(timeout):
+		return fmt.Errorf("%s timeout after %v", label, timeout)
+	}
 }
 
 // initAIClient 初始化 AI 客户端
@@ -191,8 +420,36 @@ func (a *App) syncAutoStart() {
 }
 
 // domReady DOM 加载完成时调用
+// 在 OnDomReady 中调用 Runtime 是最安全的：此时 webview 已经渲染完前端，
+// 所有 Runtime API（EventsEmit / Show / Hide 等）都可以正常工作。
+//
+// 【黑屏修复】如果此时后端 asyncInit 还没完成，再补发一次 "backend:ready"，
+// 因为前端可能没赶上 asyncInit 阶段完成时的那次事件。
+// 实际 frontend 仍然以 IsReady() 轮询为主，事件只是加速收敛。
 func (a *App) domReady(ctx context.Context) {
-	// 可以在这里触发前端初始化事件
+	enter := time.Now()
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[domReady] PANIC: %v\n", r)
+		}
+	}()
+	fmt.Printf("[domReady] enter (前端 DOM 已就绪, backendReady=%v)\n", a.IsReady())
+
+	// 主动告知前端：后端就绪状态
+	defer func() {
+		if a.ctx == nil {
+			return
+		}
+		phase := a.phase.Load()
+		wruntime.EventsEmit(a.ctx, "backend:phase", map[string]interface{}{
+			"time":  time.Now().Format(time.RFC3339),
+			"phase": phase,
+			"label": phaseLabel[phase],
+			"ready": a.IsReady(),
+		})
+	}()
+
+	fmt.Printf("[domReady] exit (耗时 %v)\n", time.Since(enter))
 }
 
 // beforeClose 关闭前钩子：返回 true 阻止关闭，返回 false 允许关闭
@@ -204,6 +461,11 @@ func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 	}
 	a.mu.Unlock()
 
+	// 关键修复：a.settings 可能在 asyncInit 失败/未到达该阶段时为 nil，
+	// 直接 a.settings.Get 会 nil 解引用 panic，导致窗口无法关闭。
+	if a.settings == nil {
+		return false
+	}
 	behavior, _ := a.settings.Get("close_behavior")
 	switch behavior {
 	case "quit":
@@ -223,8 +485,9 @@ func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 			return true
 		}
 		return false
-	case "tray":
-	default:
+	case "tray", "":
+		// 默认行为即"最小化到托盘"。当 close_behavior 为 "tray"
+		// 或未设置时，统一走"托盘可用则隐藏"分支。
 		if IsTrayRunning() {
 			wruntime.Hide(ctx)
 			return true
@@ -234,29 +497,37 @@ func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 }
 
 // QuitApp 完全退出应用（供前端调用）
+//
+// 【关键修复】字段置 nil 必须持 a.mu，否则与并发的公共方法
+// （GetAutomationTasks 读 a.scheduler、GetHighlights 读 a.db、
+// SaveSetting 读 a.settings 等）形成数据竞争，且可能 nil 解引用 panic。
+// 修复策略：持锁把字段取出并置 nil，再在锁外调用 Close/Stop（避免锁内阻塞）。
 func (a *App) QuitApp() {
 	a.shutdownOnce.Do(func() {
 		fmt.Println("Along 正在退出...")
 
 		a.mu.Lock()
 		a.isShuttingDown = true
+		sched := a.scheduler
+		a.scheduler = nil
+		client := a.aiClient
+		a.aiClient = nil
+		database := a.db
+		a.db = nil
 		a.mu.Unlock()
 
-		if a.scheduler != nil {
-			a.scheduler.Stop()
-			a.scheduler = nil
+		if sched != nil {
+			sched.Stop()
 		}
 
 		StopTray()
 
-		if a.aiClient != nil {
-			a.aiClient.Close()
-			a.aiClient = nil
+		if client != nil {
+			client.Close()
 		}
 
-		if a.db != nil {
-			a.db.Close()
-			a.db = nil
+		if database != nil {
+			database.Close()
 		}
 
 		if a.ctx != nil {
@@ -346,198 +617,6 @@ func (a *App) ensureDirectories() {
 	}
 }
 
-// initDefaultResearchTask 初始化默认的AI前沿知识调研任务
-func (a *App) initDefaultResearchTask() {
-	if a.scheduler == nil {
-		fmt.Println("自动化引擎未初始化，跳过默认任务创建")
-		return
-	}
-	a.ensureDefaultTasks()
-}
-
-// ensureDefaultTasks 确保默认任务存在
-func (a *App) ensureDefaultTasks() {
-	researchDir := filepath.Join(a.dataDir, "research_docs")
-	os.MkdirAll(researchDir, 0755)
-
-	var existingID int
-	var existingName string
-	err := a.db.QueryRow(`SELECT id, name FROM automation_tasks WHERE slash_command = ?`, "/research").Scan(&existingID, &existingName)
-
-	config := map[string]interface{}{
-		"query":        "AI前沿技术 2026 research paper arXiv 大模型最新进展 Loop AI Agentic AI 多智能体系统 推理优化 学术研究",
-		"engine":       "duckduckgo",
-		"result_count": 15,
-		"need_summary": true,
-		"output_type":  "file",
-		"file_path":    filepath.Join(researchDir, "ai_research_{{date}}.md"),
-	}
-	configJSON, _ := json.Marshal(config)
-
-	scheduleConfig := map[string]interface{}{
-		"day":  1,
-		"time": "09:00",
-	}
-	scheduleConfigJSON, _ := json.Marshal(scheduleConfig)
-
-	var taskID int
-	if err == nil && existingID > 0 {
-		task := &models.AutomationTask{
-			ID:               existingID,
-			Name:             "AI前沿知识调研",
-			Description:      "每周一上午9点自动联网搜索AI最新技术进展，AI总结后保存为文档",
-			TaskType:         "web_search",
-			Config:           string(configJSON),
-			ScheduleType:     "weekly",
-			ScheduleConfig:   string(scheduleConfigJSON),
-			Enabled:          true,
-			MaxRetries:       2,
-			RetryIntervalSec: 30,
-			SlashCommand:     "/research",
-		}
-		err = a.automationService.UpdateTask(task)
-		if err != nil {
-			fmt.Println("更新调研任务失败:", err)
-			return
-		}
-		taskID = existingID
-		fmt.Println("已更新默认任务: AI前沿知识调研")
-	} else {
-		task := &models.AutomationTask{
-			Name:             "AI前沿知识调研",
-			Description:      "每周一上午9点自动联网搜索AI最新技术进展，AI总结后保存为文档",
-			TaskType:         "web_search",
-			Config:           string(configJSON),
-			ScheduleType:     "weekly",
-			ScheduleConfig:   string(scheduleConfigJSON),
-			Enabled:          true,
-			MaxRetries:       2,
-			RetryIntervalSec: 30,
-			SlashCommand:     "/research",
-		}
-		taskID, err = a.automationService.CreateTask(task)
-		if err != nil {
-			fmt.Println("创建默认调研任务失败:", err)
-			return
-		}
-		fmt.Println("已创建默认任务: AI前沿知识调研")
-	}
-
-	a.scheduler.ScheduleTask(taskID)
-}
-
-// initTaskTemplates 初始化系统任务模板（7个最终版模板）
-func (a *App) initTaskTemplates() {
-	researchDir := filepath.Join(a.dataDir, "research_docs")
-	os.MkdirAll(researchDir, 0755)
-
-	researchPath := filepath.Join(researchDir, "research_{{date}}.md")
-
-	templates := []struct {
-		Name                  string
-		Icon                  string
-		Description           string
-		TaskType              string
-		DefaultConfig         string
-		DefaultScheduleType   string
-		DefaultScheduleConfig string
-		Steps                 string
-	}{
-		{
-			Name:                  "联网调研",
-			Icon:                  "🔍",
-			Description:           "搜索(web) → 总结(summarize) → 保存文件(file_generation)，定期搜索最新信息并生成报告",
-			TaskType:              "workflow",
-			DefaultConfig:         `{}`,
-			DefaultScheduleType:   "weekly",
-			DefaultScheduleConfig: `{"day": 1, "time": "09:00"}`,
-			Steps: `[
-				{"step_type": "web_search", "name": "搜索", "config": {"query": "", "result_count": 10}, "output_var": "search_results"},
-				{"step_type": "summarize", "name": "总结", "config": {"summary_type": "detailed", "use_raw_from": "search_results"}, "output_var": "summary"},
-				{"step_type": "file_generation", "name": "保存文件", "config": {"file_path": "` + researchPath + `", "content_var": "summary"}}
-			]`,
-		},
-		{
-			Name:                  "周报总结",
-			Icon:                  "📝",
-			Description:           "获取本周对话 → 获取本周任务 → 总结(summarize) → 保存文件，基于对话和任务生成周报",
-			TaskType:              "workflow",
-			DefaultConfig:         `{}`,
-			DefaultScheduleType:   "weekly",
-			DefaultScheduleConfig: `{"day": 5, "time": "18:00"}`,
-			Steps: `[
-				{"step_type": "agent_chat", "name": "生成本周总结报告", "config": {"prompt": "请帮我生成本周的总结报告，内容包括：本周对话摘要、计划进度回顾、里程碑完成情况、打卡记录统计、下周建议。请结合本周的所有对话内容来生成。"}, "output_var": "report"}
-			]`,
-		},
-		{
-			Name:                  "数据备份",
-			Icon:                  "💾",
-			Description:           "定期备份数据库",
-			TaskType:              "backup",
-			DefaultConfig:         `{}`,
-			DefaultScheduleType:   "daily",
-			DefaultScheduleConfig: `{"time": "23:00"}`,
-			Steps:                 "[]",
-		},
-		{
-			Name:                  "每日提醒",
-			Icon:                  "🔔",
-			Description:           "定时消息推送",
-			TaskType:              "reminder",
-			DefaultConfig:         `{"message": "该休息一下了！"}`,
-			DefaultScheduleType:   "daily",
-			DefaultScheduleConfig: `{"time": "10:00"}`,
-			Steps:                 "[]",
-		},
-		{
-			Name:                  "习惯打卡统计",
-			Icon:                  "✅",
-			Description:           "打卡 → 总结 → 通知，统计打卡情况",
-			TaskType:              "habit_checkin",
-			DefaultConfig:         `{}`,
-			DefaultScheduleType:   "daily",
-			DefaultScheduleConfig: `{"time": "22:00"}`,
-			Steps:                 "[]",
-		},
-		{
-			Name:                  "反思复盘",
-			Icon:                  "🧠",
-			Description:           "基于对话和记忆进行定期复盘",
-			TaskType:              "reflection",
-			DefaultConfig:         `{"period": "week"}`,
-			DefaultScheduleType:   "weekly",
-			DefaultScheduleConfig: `{"day": 0, "time": "20:00"}`,
-			Steps:                 "[]",
-		},
-		{
-			Name:                  "自定义工作流",
-			Icon:                  "⚙️",
-			Description:           "从头设计流程",
-			TaskType:              "workflow",
-			DefaultConfig:         `{}`,
-			DefaultScheduleType:   "manual",
-			DefaultScheduleConfig: "{}",
-			Steps:                 "[]",
-		},
-	}
-
-	for _, t := range templates {
-		var existingID int
-		err := a.db.QueryRow(`SELECT id FROM task_templates WHERE name = ? AND is_system = 1`, t.Name).Scan(&existingID)
-		if err == nil && existingID > 0 {
-			continue
-		}
-
-		_, err = a.db.Exec(`INSERT INTO task_templates (name, icon, description, task_type, default_config, default_schedule_type, default_schedule_config, steps, is_system) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-			t.Name, t.Icon, t.Description, t.TaskType, t.DefaultConfig, t.DefaultScheduleType, t.DefaultScheduleConfig, t.Steps)
-		if err != nil {
-			fmt.Printf("创建模板失败 %s: %v\n", t.Name, err)
-		}
-	}
-
-	fmt.Println("已初始化系统任务模板（7个）")
-}
-
 // ==================== 聊天相关 ====================
 
 // SendMessage 发送消息（前端调用）
@@ -573,14 +652,17 @@ func (a *App) SendMessageStream(content string) error {
 			}
 			wruntime.EventsEmit(a.ctx, "chat-stream", eventData)
 		})
-		if err == nil && fullReply != "" {
-			go NotifyNewMessage(fullReply)
-		}
 		if err != nil {
 			wruntime.EventsEmit(a.ctx, "chat-stream", map[string]interface{}{
 				"error": err.Error(),
 				"done":  true,
 			})
+			return
+		}
+		// 关键修复：只对最终的完整回复发托盘通知，避免斜杠命令
+		// 等异步场景下"占位文案"和"实际结果"导致重复通知。
+		if fullReply != "" {
+			NotifyNewMessage(fullReply)
 		}
 	}()
 
@@ -608,15 +690,20 @@ func (a *App) SendMessageStreamInConversation(conversationID int, content string
 			}
 			wruntime.EventsEmit(a.ctx, "chat-stream", eventData)
 		})
-		if err == nil && fullReply != "" {
-			go NotifyNewMessage(fullReply)
-		}
 		if err != nil {
 			wruntime.EventsEmit(a.ctx, "chat-stream", map[string]interface{}{
 				"conversation_id": conversationID,
 				"error":           err.Error(),
 				"done":            true,
 			})
+			return
+		}
+		// 关键修复：只对最终的完整回复发托盘通知，避免斜杠命令
+		// 等异步场景下"占位文案"和"实际结果"导致重复通知。
+		// 斜杠命令的真实结果已在 companionCore 内部协程完成
+		// 持久化，并由该函数返回 fullReply 一次性触发通知。
+		if fullReply != "" {
+			NotifyNewMessage(fullReply)
 		}
 	}()
 
@@ -675,6 +762,9 @@ func (a *App) GetConversationMessages(conversationID int) ([]models.Message, err
 
 // GetConversationHistory 获取对话历史（兼容旧接口：按日期）
 func (a *App) GetConversationHistory(date string) ([]models.Message, error) {
+	if a.conversation == nil {
+		return []models.Message{}, nil
+	}
 	return a.conversation.GetMessages(date)
 }
 
@@ -882,25 +972,41 @@ func (a *App) setupSettingHooks() {
 
 	// API Key 变更时更新 AI 客户端
 	a.settings.OnChange("api_key", func(key, oldValue, newValue string) error {
-		if a.aiClient != nil && newValue != "" {
-			a.aiClient.SetAPIKey(newValue)
+		if newValue == "" {
+			return nil
+		}
+		a.mu.Lock()
+		client := a.aiClient
+		a.mu.Unlock()
+		if client != nil {
+			client.SetAPIKey(newValue)
 		}
 		return nil
 	})
 
 	// API Provider 变更时重新初始化客户端
+	// 关键修复：用 a.mu 保护 a.aiClient 的读写，避免"用户切换 provider
+	// 的 goroutine"与"正在发起流式请求的 goroutine"并发读写同一指针
+	// 而出现 data race（hook 本身又处于 settings 释放写锁后的
+	// 回调上下文，不会死锁）。
 	a.settings.OnChange("api_provider", func(key, oldValue, newValue string) error {
 		if newValue == "" {
 			return nil
 		}
 		apiKey, _ := a.settings.Get("api_key")
+
+		a.mu.Lock()
 		if a.aiClient != nil {
 			a.aiClient.SetProvider(newValue)
 		} else {
 			a.aiClient = ai.NewClient(newValue, apiKey)
 		}
-		if a.companionCore != nil {
-			a.companionCore.UpdateAIClient(a.aiClient)
+		client := a.aiClient
+		core := a.companionCore
+		a.mu.Unlock()
+
+		if core != nil {
+			core.UpdateAIClient(client)
 		}
 		return nil
 	})
@@ -1079,6 +1185,9 @@ func (a *App) ExportData() (string, error) {
 
 // getAllConversations 获取所有对话
 func (a *App) getAllConversations() ([]models.Conversation, error) {
+	if a.db == nil {
+		return nil, fmt.Errorf("数据库未初始化")
+	}
 	rows, err := a.db.Query("SELECT id, date, title, agent_route, created_at FROM conversations ORDER BY created_at DESC")
 	if err != nil {
 		return nil, err
@@ -1101,6 +1210,9 @@ func (a *App) getAllConversations() ([]models.Conversation, error) {
 
 // getAllMessages 获取所有消息
 func (a *App) getAllMessages() ([]models.Message, error) {
+	if a.db == nil {
+		return nil, fmt.Errorf("数据库未初始化")
+	}
 	rows, err := a.db.Query("SELECT id, conversation_id, role, content, emotion, timestamp FROM messages ORDER BY timestamp")
 	if err != nil {
 		return nil, err
@@ -1219,6 +1331,9 @@ func scanHighlightRows(rows *sql.Rows) (models.Highlight, error) {
 
 // AddHighlight 添加高光回忆
 func (a *App) AddHighlight(title, description, date string) error {
+	if a.db == nil {
+		return fmt.Errorf("数据库未初始化")
+	}
 	_, err := a.db.Exec(
 		"INSERT INTO highlights (title, description, date, user_marked, created_at) VALUES (?, ?, ?, 1, datetime('now'))",
 		title, description, date,
@@ -1228,6 +1343,9 @@ func (a *App) AddHighlight(title, description, date string) error {
 
 // DeleteHighlight 删除高光回忆
 func (a *App) DeleteHighlight(id int) error {
+	if a.db == nil {
+		return fmt.Errorf("数据库未初始化")
+	}
 	_, err := a.db.Exec("DELETE FROM highlights WHERE id = ?", id)
 	return err
 }
@@ -1267,6 +1385,9 @@ func (a *App) GetReflections() ([]models.Reflection, error) {
 
 // ToolReadFile 读取文件内容（前端直接调用）
 func (a *App) ToolReadFile(path string) map[string]interface{} {
+	if a.companionCore == nil {
+		return map[string]interface{}{"success": false, "error": "应用未初始化"}
+	}
 	toolAgent := a.companionCore.GetToolAgent()
 	if toolAgent == nil {
 		return map[string]interface{}{
@@ -1284,6 +1405,9 @@ func (a *App) ToolReadFile(path string) map[string]interface{} {
 
 // ToolWriteFile 写入文件（前端直接调用）
 func (a *App) ToolWriteFile(path, content string) map[string]interface{} {
+	if a.companionCore == nil {
+		return map[string]interface{}{"success": false, "error": "应用未初始化"}
+	}
 	toolAgent := a.companionCore.GetToolAgent()
 	if toolAgent == nil {
 		return map[string]interface{}{
@@ -1301,6 +1425,9 @@ func (a *App) ToolWriteFile(path, content string) map[string]interface{} {
 
 // ToolListDir 列出目录内容（前端直接调用）
 func (a *App) ToolListDir(path string) map[string]interface{} {
+	if a.companionCore == nil {
+		return map[string]interface{}{"success": false, "error": "应用未初始化"}
+	}
 	toolAgent := a.companionCore.GetToolAgent()
 	if toolAgent == nil {
 		return map[string]interface{}{
@@ -1318,6 +1445,9 @@ func (a *App) ToolListDir(path string) map[string]interface{} {
 
 // ToolGitStatus 获取git状态（前端直接调用）
 func (a *App) ToolGitStatus(repoPath string) map[string]interface{} {
+	if a.companionCore == nil {
+		return map[string]interface{}{"success": false, "error": "应用未初始化"}
+	}
 	toolAgent := a.companionCore.GetToolAgent()
 	if toolAgent == nil {
 		return map[string]interface{}{
@@ -1335,6 +1465,9 @@ func (a *App) ToolGitStatus(repoPath string) map[string]interface{} {
 
 // ToolGitLog 获取git提交记录（前端直接调用）
 func (a *App) ToolGitLog(repoPath string, limit int) map[string]interface{} {
+	if a.companionCore == nil {
+		return map[string]interface{}{"success": false, "error": "应用未初始化"}
+	}
 	toolAgent := a.companionCore.GetToolAgent()
 	if toolAgent == nil {
 		return map[string]interface{}{
@@ -1352,6 +1485,9 @@ func (a *App) ToolGitLog(repoPath string, limit int) map[string]interface{} {
 
 // ToolOpenBrowser 打开浏览器链接（前端直接调用）
 func (a *App) ToolOpenBrowser(url string) map[string]interface{} {
+	if a.companionCore == nil {
+		return map[string]interface{}{"success": false, "error": "应用未初始化"}
+	}
 	toolAgent := a.companionCore.GetToolAgent()
 	if toolAgent == nil {
 		return map[string]interface{}{
@@ -1408,6 +1544,9 @@ func (a *App) GetUserName() (string, error) {
 
 // GetProactiveContent 获取主动内容
 func (a *App) GetProactiveContent() ([]models.Observation, error) {
+	if a.companionCore == nil {
+		return []models.Observation{}, nil
+	}
 	return a.companionCore.GenerateProactiveContent()
 }
 
@@ -1423,14 +1562,28 @@ func (a *App) GlobalSearch(query string) (map[string]interface{}, error) {
 		}, nil
 	}
 
-	memories, mErr := a.memory.SearchMemories(query)
-	if mErr != nil {
+	var memories []models.Memory
+	if a.memory != nil {
+		var mErr error
+		memories, mErr = a.memory.SearchMemories(query)
+		if mErr != nil {
+			memories = []models.Memory{}
+		}
+	} else {
 		memories = []models.Memory{}
 	}
-	messages, cErr := a.conversation.SearchMessages(query, 20)
-	if cErr != nil {
+
+	var messages []models.Message
+	if a.conversation != nil {
+		var cErr error
+		messages, cErr = a.conversation.SearchMessages(query, 20)
+		if cErr != nil {
+			messages = []models.Message{}
+		}
+	} else {
 		messages = []models.Message{}
 	}
+
 	highlights, hErr := a.searchHighlights(query)
 	if hErr != nil {
 		highlights = []models.Highlight{}
@@ -1444,6 +1597,9 @@ func (a *App) GlobalSearch(query string) (map[string]interface{}, error) {
 }
 
 func (a *App) searchHighlights(query string) ([]models.Highlight, error) {
+	if a.db == nil {
+		return []models.Highlight{}, nil
+	}
 	rows, err := a.db.Query(
 		"SELECT id, title, description, date, memory_ids, user_marked, created_at FROM highlights WHERE title LIKE ? OR description LIKE ? ORDER BY date DESC LIMIT 10",
 		"%"+query+"%", "%"+query+"%",
@@ -1468,6 +1624,9 @@ func (a *App) searchHighlights(query string) ([]models.Highlight, error) {
 
 // SaveMoodCheckin 保存每日心情打卡
 func (a *App) SaveMoodCheckin(mood, note string) error {
+	if a.settings == nil {
+		return fmt.Errorf("设置服务未初始化")
+	}
 	today := time.Now().Format("2006-01-02")
 	// 使用 settings 表存储，key 格式: mood_checkin_2026-07-10
 	key := "mood_checkin_" + today
@@ -1480,6 +1639,9 @@ func (a *App) SaveMoodCheckin(mood, note string) error {
 
 // GetTodayMoodCheckin 获取今日心情打卡
 func (a *App) GetTodayMoodCheckin() (map[string]string, error) {
+	if a.settings == nil {
+		return map[string]string{"mood": "", "note": "", "checked": "false"}, nil
+	}
 	today := time.Now().Format("2006-01-02")
 	key := "mood_checkin_" + today
 	val, err := a.settings.Get(key)
@@ -1501,6 +1663,9 @@ func (a *App) GetTodayMoodCheckin() (map[string]string, error) {
 
 // GetMoodHistory 获取心情打卡历史（最近30天）
 func (a *App) GetMoodHistory() ([]map[string]string, error) {
+	if a.settings == nil {
+		return []map[string]string{}, nil
+	}
 	all, err := a.settings.GetAll()
 	if err != nil {
 		return nil, err
@@ -1526,7 +1691,7 @@ func (a *App) GetMoodHistory() ([]map[string]string, error) {
 
 // GetAutomationTasks 获取自动化任务列表
 func (a *App) GetAutomationTasks(taskType string) ([]models.AutomationTask, error) {
-	if a.scheduler == nil {
+	if a.automationService == nil {
 		return []models.AutomationTask{}, nil
 	}
 	return a.automationService.GetTasks(taskType)
@@ -1534,14 +1699,17 @@ func (a *App) GetAutomationTasks(taskType string) ([]models.AutomationTask, erro
 
 // GetAutomationTask 获取单个自动化任务
 func (a *App) GetAutomationTask(id int) (*models.AutomationTask, error) {
-	if a.scheduler == nil {
-		return nil, fmt.Errorf("自动化引擎未初始化")
+	if a.automationService == nil {
+		return nil, fmt.Errorf("自动化服务未初始化")
 	}
 	return a.automationService.GetTask(id)
 }
 
 // CreateAutomationTask 创建自动化任务
 func (a *App) CreateAutomationTask(name, description, taskType, config, scheduleType, scheduleConfig string, enabled bool, slashCommand string) (int, error) {
+	if a.automationService == nil {
+		return 0, fmt.Errorf("自动化服务未初始化")
+	}
 	task := &models.AutomationTask{
 		Name:             name,
 		Description:      description,
@@ -1559,7 +1727,7 @@ func (a *App) CreateAutomationTask(name, description, taskType, config, schedule
 		return 0, err
 	}
 	// 如果启用，加入调度
-	if enabled {
+	if enabled && a.scheduler != nil {
 		a.scheduler.ScheduleTask(id)
 	}
 	return id, nil
@@ -1567,6 +1735,9 @@ func (a *App) CreateAutomationTask(name, description, taskType, config, schedule
 
 // UpdateAutomationTask 更新自动化任务
 func (a *App) UpdateAutomationTask(id int, name, description, taskType, config, scheduleType, scheduleConfig string, enabled bool, slashCommand string) error {
+	if a.automationService == nil {
+		return fmt.Errorf("自动化服务未初始化")
+	}
 	task := &models.AutomationTask{
 		ID:               id,
 		Name:             name,
@@ -1585,20 +1756,34 @@ func (a *App) UpdateAutomationTask(id int, name, description, taskType, config, 
 		return err
 	}
 	// 重新调度
-	return a.scheduler.ScheduleTask(id)
+	if a.scheduler != nil {
+		return a.scheduler.ScheduleTask(id)
+	}
+	return nil
 }
 
 // DeleteAutomationTask 删除自动化任务
 func (a *App) DeleteAutomationTask(id int) error {
-	a.scheduler.UnscheduleTask(id)
+	if a.automationService == nil {
+		return fmt.Errorf("自动化服务未初始化")
+	}
+	if a.scheduler != nil {
+		a.scheduler.UnscheduleTask(id)
+	}
 	return a.automationService.DeleteTask(id)
 }
 
 // ToggleAutomationTask 启用/禁用自动化任务
 func (a *App) ToggleAutomationTask(id int, enabled bool) error {
+	if a.automationService == nil {
+		return fmt.Errorf("自动化服务未初始化")
+	}
 	err := a.automationService.ToggleTask(id, enabled)
 	if err != nil {
 		return err
+	}
+	if a.scheduler == nil {
+		return nil
 	}
 	if enabled {
 		return a.scheduler.ScheduleTask(id)
@@ -1607,132 +1792,440 @@ func (a *App) ToggleAutomationTask(id int, enabled bool) error {
 	return nil
 }
 
-// ExecuteTask 实现 core.TaskExecutor 接口（供 companionCore 调用）
+// ExecuteTask 实现 core.TaskExecutor 接口（供 companionCore 斜杠命令调用）
 func (a *App) ExecuteTask(taskID int) *models.AutomationExecution {
+	if a.scheduler == nil {
+		return &models.AutomationExecution{Status: "failed", ErrorMessage: "调度器未初始化"}
+	}
 	return a.scheduler.ExecuteTask(taskID)
 }
 
-// RunAutomationTaskNow 立即执行自动化任务
+// RunAutomationTaskNow 立即执行自动化任务（前端调用）
 func (a *App) RunAutomationTaskNow(id int) (*models.AutomationExecution, error) {
-	exec := a.scheduler.ExecuteTask(id)
-	if exec == nil {
-		return nil, fmt.Errorf("执行失败")
-	}
-	return exec, nil
+	return a.ExecuteTask(id), nil
 }
 
 // GetAutomationExecutions 获取执行记录
 func (a *App) GetAutomationExecutions(taskID int) ([]models.AutomationExecution, error) {
+	if a.automationService == nil {
+		return []models.AutomationExecution{}, nil
+	}
 	return a.automationService.GetExecutions(taskID)
 }
 
 // GetAutomationSteps 获取workflow步骤
 func (a *App) GetAutomationSteps(taskID int) ([]models.AutomationStep, error) {
+	if a.automationService == nil {
+		return []models.AutomationStep{}, nil
+	}
 	return a.automationService.GetSteps(taskID)
 }
 
 // SaveAutomationSteps 保存workflow步骤
 func (a *App) SaveAutomationSteps(taskID int, stepsJSON string) error {
+	if a.automationService == nil {
+		return fmt.Errorf("自动化服务未初始化")
+	}
 	err := a.automationService.SaveStepsJSON(taskID, stepsJSON)
 	if err != nil {
 		return err
 	}
-	return a.scheduler.ScheduleTask(taskID)
+	if a.scheduler != nil {
+		return a.scheduler.ScheduleTask(taskID)
+	}
+	return nil
 }
 
 // GetStepExecutions 获取步骤执行详情
 func (a *App) GetStepExecutions(executionID int) ([]models.StepExecution, error) {
+	if a.automationService == nil {
+		return []models.StepExecution{}, nil
+	}
 	return a.automationService.GetStepExecutions(executionID)
 }
 
 // GetAutomationDependencies 获取任务依赖关系
 func (a *App) GetAutomationDependencies(taskID int) ([]models.AutomationDependency, error) {
+	if a.automationService == nil {
+		return []models.AutomationDependency{}, nil
+	}
 	return a.automationService.GetDependencies(taskID)
 }
 
 // GetAutomationDependents 获取依赖于指定任务的任务
 func (a *App) GetAutomationDependents(taskID int) ([]models.AutomationDependency, error) {
+	if a.automationService == nil {
+		return []models.AutomationDependency{}, nil
+	}
 	return a.automationService.GetDependents(taskID)
 }
 
 // AddAutomationDependency 添加任务依赖
 func (a *App) AddAutomationDependency(taskID, dependsOnID int, condition string) error {
+	if a.automationService == nil {
+		return fmt.Errorf("自动化服务未初始化")
+	}
 	return a.automationService.AddDependency(taskID, dependsOnID, condition)
 }
 
 // RemoveAutomationDependency 删除任务依赖
 func (a *App) RemoveAutomationDependency(id int) error {
+	if a.automationService == nil {
+		return fmt.Errorf("自动化服务未初始化")
+	}
 	return a.automationService.RemoveDependency(id)
 }
 
-// GetTaskTemplates 获取任务模板列表
-func (a *App) GetTaskTemplates() ([]models.TaskTemplate, error) {
-	if a.automationService == nil {
-		return []models.TaskTemplate{}, nil
-	}
-	return a.automationService.GetTaskTemplates()
-}
-
-// GetTaskTemplate 获取单个模板
-func (a *App) GetTaskTemplate(id int) (*models.TaskTemplate, error) {
-	if a.automationService == nil {
-		return nil, fmt.Errorf("自动化服务未初始化")
-	}
-	return a.automationService.GetTaskTemplate(id)
-}
-
-// executeAutomationTask 执行自动化任务（通过 Orchestrator）
-func (a *App) executeAutomationTask(task *models.AutomationTask) *models.AutomationExecution {
+// executeAutomationTask 执行业务逻辑（不再创建执行记录，由 scheduler 统一管理）
+// - workflow 类型：读取保存的步骤，通过 Pipeline 按序执行
+// - web_search 类型：使用 ResearchAgent 深度调研
+// - 其他类型：使用 Orchestrator 规划执行
+func (a *App) executeAutomationTask(execID int, task *models.AutomationTask) *models.AutomationExecution {
 	startTime := time.Now()
-	execID, err := a.automationService.CreateExecution(task.ID)
-	if err != nil {
-		return &models.AutomationExecution{Status: "failed", ErrorMessage: err.Error()}
-	}
 
 	if a.companionCore == nil {
-		a.automationService.UpdateExecution(execID, "failed", "none", "", "", "系统未初始化", 0)
-		return &models.AutomationExecution{ID: execID, Status: "failed"}
+		return &models.AutomationExecution{ID: execID, Status: "failed", ErrorMessage: "系统未初始化"}
 	}
 
-	// 使用 Orchestrator 规划并执行
-	result, err := a.companionCore.GetOrchestrator().Process(task.Description)
-	status := "success"
-	errMsg := ""
-	content := ""
+	var status, resultType, content, filePath, errMsg string
+	var err error
+
+	switch task.TaskType {
+	case "workflow":
+		content, filePath, err = a.executeWorkflowTask(task, execID)
+	case "web_search":
+		content, filePath, err = a.executeDeepResearchTask(task)
+	default:
+		// agent_chat, report, reminder, reflection 等走 Orchestrator
+		result, orchErr := a.companionCore.GetOrchestrator().Process(task.Description)
+		if orchErr != nil {
+			err = orchErr
+		} else if result != nil {
+			content = result.Content
+		}
+	}
+
 	if err != nil {
 		status = "failed"
 		errMsg = err.Error()
-	}
-	if result != nil {
-		content = result.Content
+	} else {
+		status = "success"
+		resultType = "text"
+		if filePath != "" {
+			resultType = "file"
+		}
 	}
 
 	duration := time.Since(startTime).Milliseconds()
-	a.automationService.UpdateExecution(execID, status, "text", content, "", errMsg, duration)
 
 	return &models.AutomationExecution{
 		ID:            execID,
 		TaskID:        task.ID,
 		Status:        status,
+		ResultType:    resultType,
 		ResultContent: content,
+		ResultPath:    filePath,
 		ErrorMessage:  errMsg,
 		DurationMs:    duration,
 	}
 }
 
-// CreateTaskFromTemplate 从模板创建任务
-func (a *App) CreateTaskFromTemplate(templateID int, name, description string, scheduleType, scheduleConfig, slashCommand string) (int, error) {
-	id, err := a.automationService.CreateTaskFromTemplate(templateID, name, description, scheduleType, scheduleConfig, slashCommand)
-	if err != nil {
-		return 0, err
+// executeWorkflowTask 执行 workflow 类型任务：读取已保存步骤 → 构建 Plan → Pipeline 逐步骤执行
+func (a *App) executeWorkflowTask(task *models.AutomationTask, execID int) (content, filePath string, err error) {
+	steps, err := a.automationService.GetSteps(task.ID)
+	if err != nil || len(steps) == 0 {
+		// 无步骤时回退到 Orchestrator
+		result, orchErr := a.companionCore.GetOrchestrator().Process(task.Description)
+		if orchErr != nil {
+			return "", "", orchErr
+		}
+		if result != nil {
+			return result.Content, "", nil
+		}
+		return "任务完成（无步骤）", "", nil
 	}
-	a.scheduler.ScheduleTask(id)
-	return id, nil
+
+	// 构建流水线步骤
+	pipelineSteps := make([]pipeline.Step, 0, len(steps))
+	for _, s := range steps {
+		agentName, input := mapStepToAgent(s)
+		// 用实时时间解析输入中的变量
+		input = services.ReplaceVariables(input, nil)
+		pipelineSteps = append(pipelineSteps, pipeline.Step{
+			AgentName: agentName,
+			Input:     input,
+			OutputVar: s.OutputVar,
+		})
+	}
+
+	plan := pipeline.Plan{Steps: pipelineSteps}
+	runner := a.companionCore.GetOrchestrator().GetPipeline()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	result := runner.Run(ctx, plan, nil, nil)
+	if !result.Success {
+		return "", "", fmt.Errorf("流水线执行失败: %s", result.Error)
+	}
+
+	// 提取最终内容
+	content = result.Content
+	for i := len(result.Steps) - 1; i >= 0; i-- {
+		if result.Steps[i].Content != "" && result.Steps[i].Content != "(skipped)" {
+			content = result.Steps[i].Content
+			// 如果最后一步是文件生成，提取路径
+			if steps[i].StepType == "file_generation" || steps[i].StepType == "save_file" {
+				filePath = extractFilePath(result.Steps[i].Content, steps[i].Config)
+			}
+			break
+		}
+	}
+
+	return content, filePath, nil
+}
+
+// mapStepToAgent 将步骤类型映射为 Agent 名称和输入内容
+func mapStepToAgent(s models.AutomationStep) (agentName, input string) {
+	cfg := parseSimpleConfig(s.Config)
+
+	switch s.StepType {
+	case "web_search", "search":
+		// 使用 research agent 做深度调研
+		agentName = "research"
+		query, _ := cfg["query"].(string)
+		if query == "" {
+			query = s.Name
+		}
+		input = query
+	case "summarize":
+		agentName = "summarize"
+		rawFrom, _ := cfg["use_raw_from"].(string)
+		if rawFrom != "" {
+			input = fmt.Sprintf("请对以下内容进行详细总结：\n{{%s}}", rawFrom)
+		} else {
+			input = "请对搜索到的内容进行结构化总结"
+		}
+	case "file_generation", "save_file":
+		agentName = "file_generation"
+		contentVar, _ := cfg["content_var"].(string)
+		fp, _ := cfg["file_path"].(string)
+		if contentVar != "" {
+			input = fmt.Sprintf("将以下内容保存为文件：\n{{%s}}", contentVar)
+		} else {
+			input = "保存内容到文件"
+		}
+		if fp != "" {
+			input += fmt.Sprintf("\n文件路径：%s", fp)
+		}
+	case "agent", "agent_chat":
+		agentName, _ = cfg["agent_name"].(string)
+		if agentName == "" {
+			agentName = "web"
+		}
+		prompt, _ := cfg["prompt"].(string)
+		input = prompt
+		if input == "" {
+			input = s.Name
+		}
+	case "notify":
+		agentName = "emotion"
+		notifyContent, _ := cfg["content"].(string)
+		input = notifyContent
+	default:
+		agentName = "web"
+		input = s.Name
+	}
+
+	if input == "" {
+		input = s.Name
+	}
+
+	return agentName, input
+}
+
+// executeDeepResearchTask 使用 ResearchAgent 做深度联网调研（自动保存文件）
+func (a *App) executeDeepResearchTask(task *models.AutomationTask) (content, filePath string, err error) {
+	cfg := parseSimpleConfig(task.Config)
+	query, _ := cfg["query"].(string)
+	if query == "" {
+		query = task.Description
+	}
+	if query == "" {
+		query = task.Name
+	}
+
+	researchAgent := a.companionCore.GetResearchAgent()
+	if researchAgent == nil {
+		return "", "", fmt.Errorf("调研 Agent 未初始化")
+	}
+
+	// 注入实时时间 + 当前年份到查询，确保时效性
+	now := time.Now()
+	query = services.ReplaceVariables(query, nil)
+	// 自动追加年份确保搜索结果的时效性
+	if !strings.Contains(query, now.Format("2006")) {
+		query = query + " " + now.Format("2006")
+	}
+
+	ctxAgent := agents.AgentContext{
+		Content: query,
+		History: []ai.Message{},
+		Extra: map[string]interface{}{
+			"source": "automation_task",
+		},
+	}
+
+	result, err := researchAgent.Process(ctxAgent)
+	if err != nil {
+		return "", "", fmt.Errorf("调研执行失败: %w", err)
+	}
+
+	content = result.Content
+
+	// 自动保存调研结果到文件
+	researchDir := filepath.Join(a.dataDir, "research_docs")
+	os.MkdirAll(researchDir, 0755)
+
+	// 生成安全的文件名
+	safeName := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '/' || r == '\\' || r == ':' {
+			return '_'
+		}
+		return r
+	}, strings.TrimSpace(task.Name))
+	if len(safeName) > 30 {
+		safeName = safeName[:30]
+	}
+
+	specifiedPath := filepath.Join(researchDir, fmt.Sprintf("%s_{{date}}_{{time}}.md", safeName))
+	specifiedPath = services.ReplaceVariables(specifiedPath, nil)
+
+	if a.companionCore.GetFileGenerationAgent() != nil {
+		fileAgent := a.companionCore.GetFileGenerationAgent()
+		fileCtx := agents.AgentContext{
+			Content: content,
+			History: []ai.Message{},
+			Extra: map[string]interface{}{
+				"raw_content": content,
+				"title":       query,
+				"template":    "research",
+				"file_path":   specifiedPath,
+			},
+		}
+		fileResult, fileErr := fileAgent.Process(fileCtx)
+		if fileErr == nil && fileResult != nil {
+			if dataMap, ok := fileResult.Data.(map[string]interface{}); ok {
+				if fp, ok := dataMap["file_path"].(string); ok {
+					filePath = fp
+				}
+			}
+		}
+		// 即使文件保存失败也不影响调研结果返回
+	}
+
+	return content, filePath, nil
+}
+
+// parseSimpleConfig 解析 JSON 配置为 map（容错）
+// 解析失败时打印日志，避免上游拿到错误的"空配置"还误以为配置正确。
+func parseSimpleConfig(configJSON string) map[string]interface{} {
+	cfg := make(map[string]interface{})
+	if configJSON == "" {
+		return cfg
+	}
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		fmt.Printf("[parseSimpleConfig] 解析配置失败: %v (raw=%q)\n", err, configJSON)
+		cfg = make(map[string]interface{})
+	}
+	return cfg
+}
+
+// extractFilePath 从步骤内容/配置中提取文件路径
+func extractFilePath(content, configJSON string) string {
+	cfg := parseSimpleConfig(configJSON)
+	if fp, ok := cfg["file_path"].(string); ok && fp != "" {
+		return fp
+	}
+	// 尝试从内容中提取路径
+	if strings.Contains(content, "文件路径") {
+		parts := strings.Split(content, "\n")
+		for _, p := range parts {
+			if strings.Contains(p, ".md") || strings.Contains(p, ".txt") {
+				return strings.TrimSpace(p)
+			}
+		}
+	}
+	return ""
 }
 
 // GetTaskBySlashCommand 根据斜杠命令获取任务
 func (a *App) GetTaskBySlashCommand(command string) (*models.AutomationTask, error) {
+	if a.automationService == nil {
+		return nil, fmt.Errorf("自动化服务未初始化")
+	}
 	return a.automationService.GetTaskBySlashCommand(command)
+}
+
+// SlashCommandInfo 斜杠命令信息（前端指令菜单用）
+// Cmd 形如 "/plan"；Kind 区分 "default"（内置提示词）和 "custom"（自动化任务）。
+// Desc 为简短的描述，优先取任务的 description，否则取任务名。
+type SlashCommandInfo struct {
+	Cmd  string `json:"cmd"`
+	Kind string `json:"kind"`
+	Desc string `json:"desc"`
+}
+
+// GetAvailableSlashCommands 获取所有可用的斜杠命令：
+//   - default：内置提示词命令（/plan、/review、/memory）
+//   - custom：用户自己在自动化页面创建、带 slash_command 的任务
+//
+// 用于前端 ChatInput 的指令弹层，做到"用户新建/删除任务后命令菜单
+// 实时同步"，避免硬编码遗漏。
+func (a *App) GetAvailableSlashCommands() ([]SlashCommandInfo, error) {
+	out := make([]SlashCommandInfo, 0, 8)
+
+	// 1) 内置命令：与 companion_core.detectSlashCommand 的 switch 分支保持一致
+	out = append(out,
+		SlashCommandInfo{Cmd: "/plan", Kind: "default", Desc: "制定计划 / 设置目标"},
+		SlashCommandInfo{Cmd: "/review", Kind: "default", Desc: "回顾复盘 / 总结"},
+		SlashCommandInfo{Cmd: "/memory", Kind: "default", Desc: "查看记忆 / 回忆"},
+	)
+
+	// 2) 自定义命令：来自 automation_tasks 表，slash_command 非空且启用
+	if a.automationService == nil {
+		return out, nil
+	}
+	tasks, err := a.automationService.GetTasks("")
+	if err != nil {
+		// 出错时仍返回内置命令，不阻断前端
+		fmt.Printf("[GetAvailableSlashCommands] 加载自动化任务失败: %v\n", err)
+		return out, nil
+	}
+	for _, t := range tasks {
+		if !t.Enabled {
+			continue
+		}
+		cmd := strings.TrimSpace(t.SlashCommand)
+		if cmd == "" {
+			continue
+		}
+		// 统一以 "/" 开头
+		if !strings.HasPrefix(cmd, "/") {
+			cmd = "/" + cmd
+		}
+		// 与内置命令重名时让自定义覆盖（用户主动配置应优先于默认）
+		desc := strings.TrimSpace(t.Description)
+		if desc == "" {
+			desc = t.Name
+		}
+		out = append(out, SlashCommandInfo{
+			Cmd:  cmd,
+			Kind: "custom",
+			Desc: desc,
+		})
+	}
+	return out, nil
 }
 
 // GetTaskConfigSchema 获取任务类型配置表单Schema
@@ -1915,12 +2408,16 @@ func (a *App) GetTopicSuggestions() ([]string, error) {
 	}
 
 	// 根据记忆个性化话题
-	mems, err := a.memory.GetKeyMemories(5)
-	if err == nil && len(mems) > 0 {
-		for _, m := range mems {
-			if m.Type == "L4-PLAN" || m.Type == "L4-计划目标" {
-				suggestions = append([]string{"跟进「" + m.Content + "」的进展"}, suggestions...)
-				break
+	// 注意：记忆模型中类型为 L1/L2/L3/L4/L5，不是 "L4-PLAN"。
+	// 这里匹配 L4（项目目标）以及它的常见中文化别名。
+	if a.memory != nil {
+		mems, err := a.memory.GetKeyMemories(5)
+		if err == nil && len(mems) > 0 {
+			for _, m := range mems {
+				if m.Type == "L4" || m.Type == "L4-PLAN" || m.Type == "L4-计划目标" {
+					suggestions = append([]string{"跟进「" + m.Content + "」的进展"}, suggestions...)
+					break
+				}
 			}
 		}
 	}
