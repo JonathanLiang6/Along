@@ -297,17 +297,17 @@ func addColumnIfMissing(db *sql.DB, table, column, defType string) error {
 }
 
 // migrateLegacyTables 迁移旧表数据到新的自动化表
+// 修复 #22：每条记录的迁移用事务包裹，任一旧表批量迁移失败时整体回滚，
+// 避免出现"新表一半迁移、一半缺失"的不一致状态。
 func migrateLegacyTables(db *sql.DB) error {
 	var taskCount int
-	db.QueryRow("SELECT count(*) FROM automation_tasks").Scan(&taskCount)
+	if err := db.QueryRow("SELECT count(*) FROM automation_tasks").Scan(&taskCount); err != nil {
+		// 表还没建好也属于异常，但 allow 跳过
+		return nil
+	}
 	if taskCount > 0 {
 		return nil
 	}
-
-	schedulesTable := ""
-	toolflowsTable := ""
-	scheduleExecTable := ""
-	toolflowExecTable := ""
 
 	checkTable := func(orig, legacy string) string {
 		var cnt int
@@ -322,16 +322,28 @@ func migrateLegacyTables(db *sql.DB) error {
 		return ""
 	}
 
-	schedulesTable = checkTable("schedules", "schedules_legacy")
-	toolflowsTable = checkTable("toolflows", "toolflows_legacy")
-	scheduleExecTable = checkTable("schedule_executions", "schedule_executions_legacy")
-	toolflowExecTable = checkTable("toolflow_executions", "toolflow_executions_legacy")
+	schedulesTable := checkTable("schedules", "schedules_legacy")
+	toolflowsTable := checkTable("toolflows", "toolflows_legacy")
+	scheduleExecTable := checkTable("schedule_executions", "schedule_executions_legacy")
+	toolflowExecTable := checkTable("toolflow_executions", "toolflow_executions_legacy")
 
 	if schedulesTable == "" && toolflowsTable == "" {
 		return nil
 	}
 
 	log.Println("开始迁移旧表数据到自动化任务系统...")
+
+	// 在单一事务内完成所有迁移，保证原子性。
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("开启迁移事务失败: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
 
 	scheduleIDMap := make(map[int]int)
 	toolflowIDMap := make(map[int]int)
@@ -345,27 +357,23 @@ func migrateLegacyTables(db *sql.DB) error {
 		createdAt   sql.NullString
 		updatedAt   sql.NullString
 	}
-	var toolflowRows []toolflowRow
 	if toolflowsTable != "" {
-		rows, err := db.Query(fmt.Sprintf("SELECT id, name, description, steps, enabled, created_at, updated_at FROM %s", toolflowsTable))
+		rows, err := tx.Query(fmt.Sprintf("SELECT id, name, description, steps, enabled, created_at, updated_at FROM %s", toolflowsTable))
 		if err == nil {
+			defer rows.Close()
 			for rows.Next() {
 				var r toolflowRow
 				if rows.Scan(&r.id, &r.name, &r.description, &r.steps, &r.enabled, &r.createdAt, &r.updatedAt) != nil {
 					continue
 				}
-				toolflowRows = append(toolflowRows, r)
+				result, execErr := tx.Exec(`INSERT INTO automation_tasks (name, description, task_type, config, schedule_type, schedule_config, enabled, status, created_at, updated_at) VALUES (?, ?, 'workflow', '{}', 'custom', '{}', ?, 'idle', ?, ?)`, r.name, r.description, r.enabled, r.createdAt.String, r.updatedAt.String)
+				if execErr != nil {
+					continue
+				}
+				newID, _ := result.LastInsertId()
+				toolflowIDMap[r.id] = int(newID)
+				migrateToolFlowStepsTx(tx, int(newID), r.steps)
 			}
-			rows.Close()
-		}
-		for _, r := range toolflowRows {
-			result, err := db.Exec(`INSERT INTO automation_tasks (name, description, task_type, config, schedule_type, schedule_config, enabled, status, created_at, updated_at) VALUES (?, ?, 'workflow', '{}', 'custom', '{}', ?, 'idle', ?, ?)`, r.name, r.description, r.enabled, r.createdAt.String, r.updatedAt.String)
-			if err != nil {
-				continue
-			}
-			newID, _ := result.LastInsertId()
-			toolflowIDMap[r.id] = int(newID)
-			migrateToolFlowSteps(db, int(newID), r.steps)
 		}
 	}
 
@@ -383,50 +391,46 @@ func migrateLegacyTables(db *sql.DB) error {
 		createdAt     sql.NullString
 		updatedAt     sql.NullString
 	}
-	var scheduleRows []scheduleRow
 	if schedulesTable != "" {
-		rows, err := db.Query(fmt.Sprintf("SELECT id, name, cron_expression, description, action_type, action_payload, enabled, last_run_at, next_run_at, status, created_at, updated_at FROM %s", schedulesTable))
+		rows, err := tx.Query(fmt.Sprintf("SELECT id, name, cron_expression, description, action_type, action_payload, enabled, last_run_at, next_run_at, status, created_at, updated_at FROM %s", schedulesTable))
 		if err == nil {
+			defer rows.Close()
 			for rows.Next() {
 				var r scheduleRow
 				if rows.Scan(&r.id, &r.name, &r.cronExpr, &r.description, &r.actionType, &r.actionPayload, &r.enabled, &r.lastRunAt, &r.nextRunAt, &r.status, &r.createdAt, &r.updatedAt) != nil {
 					continue
 				}
-				scheduleRows = append(scheduleRows, r)
-			}
-			rows.Close()
-		}
-		for _, r := range scheduleRows {
-			taskType := "agent_chat"
-			config := "{}"
-			switch r.actionType {
-			case "agent_call":
-				taskType = "agent_chat"
-				config = r.actionPayload
-			case "message":
-				taskType = "reminder"
-				config = r.actionPayload
-			case "tool_flow":
-				taskType = "workflow"
-				config = r.actionPayload
-			}
-
-			scheduleConfig := fmt.Sprintf(`{"type":"custom","cron":"%s"}`, r.cronExpr)
-
-			statusVal := "idle"
-			if r.status.Valid {
-				switch r.status.String {
-				case "success", "failed", "running":
-					statusVal = r.status.String
+				taskType := "agent_chat"
+				config := "{}"
+				switch r.actionType {
+				case "agent_call":
+					taskType = "agent_chat"
+					config = r.actionPayload
+				case "message":
+					taskType = "reminder"
+					config = r.actionPayload
+				case "tool_flow":
+					taskType = "workflow"
+					config = r.actionPayload
 				}
-			}
 
-			result, err := db.Exec(`INSERT INTO automation_tasks (name, description, task_type, config, schedule_type, schedule_config, enabled, status, last_run_at, next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, 'custom', ?, ?, ?, ?, ?, ?, ?)`, r.name, r.description, taskType, config, scheduleConfig, r.enabled, statusVal, r.lastRunAt.String, r.nextRunAt.String, r.createdAt.String, r.updatedAt.String)
-			if err != nil {
-				continue
+				scheduleConfig := fmt.Sprintf(`{"type":"custom","cron":"%s"}`, r.cronExpr)
+
+				statusVal := "idle"
+				if r.status.Valid {
+					switch r.status.String {
+					case "success", "failed", "running":
+						statusVal = r.status.String
+					}
+				}
+
+				result, execErr := tx.Exec(`INSERT INTO automation_tasks (name, description, task_type, config, schedule_type, schedule_config, enabled, status, last_run_at, next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, 'custom', ?, ?, ?, ?, ?, ?, ?)`, r.name, r.description, taskType, config, scheduleConfig, r.enabled, statusVal, r.lastRunAt.String, r.nextRunAt.String, r.createdAt.String, r.updatedAt.String)
+				if execErr != nil {
+					continue
+				}
+				newID, _ := result.LastInsertId()
+				scheduleIDMap[r.id] = int(newID)
 			}
-			newID, _ := result.LastInsertId()
-			scheduleIDMap[r.id] = int(newID)
 		}
 	}
 
@@ -438,41 +442,28 @@ func migrateLegacyTables(db *sql.DB) error {
 		result       sql.NullString
 		executedAt   sql.NullString
 	}
-	var scheduleExecRows []execRow
 	if scheduleExecTable != "" {
-		rows, err := db.Query(fmt.Sprintf("SELECT id, schedule_id, status, error_message, result, executed_at FROM %s", scheduleExecTable))
+		rows, err := tx.Query(fmt.Sprintf("SELECT id, schedule_id, status, error_message, result, executed_at FROM %s", scheduleExecTable))
 		if err == nil {
+			defer rows.Close()
 			for rows.Next() {
 				var r execRow
 				if rows.Scan(&r.id, &r.refID, &r.status, &r.errorMessage, &r.result, &r.executedAt) != nil {
 					continue
 				}
-				scheduleExecRows = append(scheduleExecRows, r)
+				newTaskID, ok := scheduleIDMap[r.refID]
+				if !ok {
+					continue
+				}
+				tx.Exec(`INSERT INTO automation_executions (task_id, status, result_type, result_content, error_message, started_at, finished_at) VALUES (?, ?, 'text', ?, ?, ?, ?)`, newTaskID, r.status.String, r.result.String, r.errorMessage.String, r.executedAt.String, r.executedAt.String)
 			}
-			rows.Close()
-		}
-		for _, r := range scheduleExecRows {
-			newTaskID, ok := scheduleIDMap[r.refID]
-			if !ok {
-				continue
-			}
-			db.Exec(`INSERT INTO automation_executions (task_id, status, result_type, result_content, error_message, started_at, finished_at) VALUES (?, ?, 'text', ?, ?, ?, ?)`, newTaskID, r.status.String, r.result.String, r.errorMessage.String, r.executedAt.String, r.executedAt.String)
 		}
 	}
 
-	var toolflowExecRows []struct {
-		id           int
-		refID        int
-		status       sql.NullString
-		inputs       sql.NullString
-		outputs      sql.NullString
-		errorMessage sql.NullString
-		startedAt    sql.NullString
-		finishedAt   sql.NullString
-	}
 	if toolflowExecTable != "" {
-		rows, err := db.Query(fmt.Sprintf("SELECT id, toolflow_id, status, inputs, outputs, error_message, started_at, finished_at FROM %s", toolflowExecTable))
+		rows, err := tx.Query(fmt.Sprintf("SELECT id, toolflow_id, status, inputs, outputs, error_message, started_at, finished_at FROM %s", toolflowExecTable))
 		if err == nil {
+			defer rows.Close()
 			for rows.Next() {
 				var r struct {
 					id           int
@@ -487,16 +478,12 @@ func migrateLegacyTables(db *sql.DB) error {
 				if rows.Scan(&r.id, &r.refID, &r.status, &r.inputs, &r.outputs, &r.errorMessage, &r.startedAt, &r.finishedAt) != nil {
 					continue
 				}
-				toolflowExecRows = append(toolflowExecRows, r)
+				newTaskID, ok := toolflowIDMap[r.refID]
+				if !ok {
+					continue
+				}
+				tx.Exec(`INSERT INTO automation_executions (task_id, status, result_type, result_content, error_message, started_at, finished_at) VALUES (?, ?, 'text', ?, ?, ?, ?)`, newTaskID, r.status.String, r.outputs.String, r.errorMessage.String, r.startedAt.String, r.finishedAt.String)
 			}
-			rows.Close()
-		}
-		for _, r := range toolflowExecRows {
-			newTaskID, ok := toolflowIDMap[r.refID]
-			if !ok {
-				continue
-			}
-			db.Exec(`INSERT INTO automation_executions (task_id, status, result_type, result_content, error_message, started_at, finished_at) VALUES (?, ?, 'text', ?, ?, ?, ?)`, newTaskID, r.status.String, r.outputs.String, r.errorMessage.String, r.startedAt.String, r.finishedAt.String)
 		}
 	}
 
@@ -504,16 +491,22 @@ func migrateLegacyTables(db *sql.DB) error {
 		var cnt int
 		db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&cnt)
 		if cnt > 0 {
-			db.Exec(fmt.Sprintf("ALTER TABLE %s RENAME TO %s_legacy", table, table))
+			// 在事务里执行重命名（DDL 在事务内也是原子的）
+			tx.Exec(fmt.Sprintf("ALTER TABLE %s RENAME TO %s_legacy", table, table))
 		}
 	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交迁移事务失败: %w", err)
+	}
+	committed = true
 
 	log.Println("旧表数据迁移完成")
 	return nil
 }
 
-// migrateToolFlowSteps 将工具流步骤JSON迁移到automation_steps表
-func migrateToolFlowSteps(db *sql.DB, taskID int, stepsJSON string) {
+// migrateToolFlowStepsTx 事务版：将工具流步骤JSON迁移到automation_steps表
+func migrateToolFlowStepsTx(tx *sql.Tx, taskID int, stepsJSON string) {
 	var steps []struct {
 		ID         string                 `json:"id"`
 		Type       string                 `json:"type"`
@@ -538,7 +531,7 @@ func migrateToolFlowSteps(db *sql.DB, taskID int, stepsJSON string) {
 			name = step.ToolAction
 		}
 
-		db.Exec(`INSERT INTO automation_steps (task_id, step_index, step_type, name, config, output_var, next_on_success, next_on_failure)
+		tx.Exec(`INSERT INTO automation_steps (task_id, step_index, step_type, name, config, output_var, next_on_success, next_on_failure)
 			VALUES (?, ?, ?, ?, ?, '', 0, -1)`,
 			taskID, i, step.Type, name, string(configBytes))
 	}
