@@ -228,9 +228,11 @@ func (am *AgentManager) ProcessStream(ctx AgentContext, callback StreamCallback)
 }
 
 // UpdateAIClients 更新所有 Agent 的 AI 客户端
+// 写操作必须持写锁（不能用 RLock），否则在 UpdateAIClients 进行中
+// 有其他 goroutine 读取 agents map 时可能读到正在变更的状态。
 func (am *AgentManager) UpdateAIClients(client *ai.Client) {
-	am.mu.RLock()
-	defer am.mu.RUnlock()
+	am.mu.Lock()
+	defer am.mu.Unlock()
 	for _, agent := range am.agents {
 		agent.UpdateAIClient(client)
 	}
